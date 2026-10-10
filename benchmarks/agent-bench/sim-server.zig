@@ -15,6 +15,7 @@ const max_request_bytes = 8 * 1024 * 1024;
 
 var next_request_id: std.atomic.Value(u64) = .init(1);
 var next_seq: std.atomic.Value(u64) = .init(1);
+var next_script_seq: std.atomic.Value(u64) = .init(1);
 
 const Profile = struct {
     name: []const u8,
@@ -43,6 +44,7 @@ const Config = struct {
 var g_config: Config = undefined;
 var g_script_steps: ?[]ScriptStep = null;
 var g_timing_mutex: std.Io.Mutex = .init;
+var g_timing_file: ?std.Io.File = null;
 
 const ScriptStep = struct {
     tool_calls: ?[]ScriptToolCall,
@@ -64,6 +66,15 @@ pub fn main(init: std.process.Init) !void {
 
     if (g_config.script_path) |path| {
         g_script_steps = try loadScript(alloc, path);
+    }
+
+    // Open timing log once at startup to avoid per-request open/stat/close.
+    if (g_config.timing_log_path) |path| {
+        var f = try std.Io.Dir.cwd().createFile(init.io, path, .{ .truncate = false });
+        const st = try f.stat(init.io);
+        g_timing_offset = st.size;
+        g_timing_file = f;
+        // Intentionally not closed until process exit; harness kills the server.
     }
 
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", g_config.port);
@@ -249,8 +260,7 @@ fn serveConnectionFallible(io: std.Io, stream: std.Io.net.Stream) !void {
         const seq = next_seq.fetchAdd(1, .monotonic);
         var req_body_buf: [8 * 1024]u8 = undefined;
         const req_body = try request.readerExpectContinue(&req_body_buf);
-        const req_bytes = try req_body.discardRemaining();
-        _ = req_bytes;
+        _ = try req_body.discardRemaining();
 
         const profile = g_config.profile;
 
@@ -290,7 +300,10 @@ fn serveConnectionFallible(io: std.Io, stream: std.Io.net.Stream) !void {
             });
             t_first_chunk = nowMs();
 
-            const step = pickStep(seq);
+            // Script seq only advances on successful responses, so that
+            // client retries after injected failures receive the same step.
+            const script_seq = next_script_seq.fetchAdd(1, .monotonic);
+            const step = pickStep(script_seq);
             var conn_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer conn_arena.deinit();
             tokens = try writeSseChunks(io, &response.writer, conn_arena.allocator(), step, profile, rand);
@@ -326,21 +339,22 @@ const TimingRow = struct {
 };
 
 fn logTiming(io: std.Io, row: TimingRow) !void {
-    const path = g_config.timing_log_path orelse return;
+    const file = g_timing_file orelse return;
+    // Note: file was opened once at startup with truncate=false; we track
+    // the write offset manually to avoid stat() per request.
     g_timing_mutex.lockUncancelable(io);
     defer g_timing_mutex.unlock(io);
 
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
-    defer file.close(io);
-    const st = try file.stat(io);
-    const end_pos = st.size;
-
-    var buf: [512]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf,
+    var tmp: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&tmp,
         "{{\"t_start_ms\":{d},\"t_first_chunk_ms\":{d},\"t_end_ms\":{d},\"ttft_ms\":{d},\"tokens\":{d},\"profile\":\"{s}\",\"req_seq\":{d},\"status\":{d}}}\n",
         .{ row.t_start_ms, row.t_first_chunk_ms, row.t_end_ms, row.ttft_ms, row.tokens, row.profile, row.req_seq, row.status });
-    try file.writePositionalAll(io, line, end_pos);
+    // Use positional write at tracked offset; updated atomically under mutex.
+    try file.writePositionalAll(io, line, g_timing_offset);
+    g_timing_offset += line.len;
 }
+
+var g_timing_offset: u64 = 0;
 
 fn pickStep(seq: u64) ?ScriptStep {
     const steps = g_script_steps orelse return null;
