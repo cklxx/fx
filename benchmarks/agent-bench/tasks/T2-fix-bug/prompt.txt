@@ -1,0 +1,1 @@
+Fix the off-by-one bug in buggy.py in the current directory. The function total() must sum ALL elements. After your fix, running "python3 buggy.py" must exit 0 and print "all assertions passed". Do not change the assertions.

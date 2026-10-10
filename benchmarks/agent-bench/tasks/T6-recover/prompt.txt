@@ -1,0 +1,1 @@
+First run "python3 -c 'import nosuchmodule_xyz'". It will fail. Read the error message, then create fix.py that prints "recovered: ModuleNotFoundError" (use the actual exception type name from the error). Running "python3 fix.py" must print exactly that.

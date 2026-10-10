@@ -1,0 +1,1 @@
+Refactor long.py in the current directory: extract the repeated print-and-return pattern into a helper function named report(name, value). Keep behavior identical (same stdout). The file must define at most 4 functions total after refactor. Verify with "python3 long.py".
