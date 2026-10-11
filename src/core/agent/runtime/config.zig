@@ -60,6 +60,10 @@ pub const Config = struct {
     /// of its `order` preference.
     provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
+    /// Skip the model confirmation round after tool execution when all tools
+    /// succeed with no decision-relevant output. Only for non-interactive
+    /// `fx ask` mode. Saves one TTFT per turn.
+    skip_confirm_round: bool = false,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
