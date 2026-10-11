@@ -1,13 +1,16 @@
-# tmux_compile 例子：三个用户故事
+# tmux_compile 例子：六个用户故事
 
-每个目录一个故事：`setup.sh`（建真实 git 测试场）→ `dsl.yaml`（可编译）
+每个目录一个故事：`setup.sh`（建测试场）→ `dsl.yaml`（可编译）
 → `run.sh`（编译 + 运行 + 断言）。`run_all.sh` 全跑。
 
-| 故事 | 编排 | agent 替身 | 真实度 |
-|------|------|-----------|--------|
-| `bug-hunt` | 复现 → `git bisect run` → 逆向 culprit → 验证 | 无 | 全真 |
-| `pr-review` | 3 reviewer 并行 → 汇总 → 条件修复 | `review.sh`、`fix.sh` | 编排全真 |
-| `parallel-dev` | 3 worktree 并行 → 顺序 merge → 冲突诚实停 | `implement.sh` | 编排全真 |
+| 故事 | 编排 | 对应真实 case | 真实度 |
+|------|------|-------------|--------|
+| `bug-hunt` | 复现 → `git bisect run` → 逆向 culprit → 验证 | 通用 bisect 模式 | 全真 |
+| `pr-review` | 3 reviewer 并行 → 汇总 → 条件修复 | M2（三路并行 review） | 编排全真（`review.sh`/`fix.sh` 替身） |
+| `parallel-dev` | 3 worktree 并行 → 顺序 merge → 冲突诚实停 | M3 + T5 | 编排全真（`implement.sh` 替身） |
+| `deploy-healthcheck` | 蓝绿部署 → 健康检查 → 条件切流量（含失败路径） | D1（capistrano-bluey） | 全真（fake service，无外部依赖） |
+| `retry-until-ready` | 迁移 → 有界重试等 lag 排空 → panic flag 熔断 | D7（gh-ost） | 全真 |
+| `conditional-setup` | 逐服务探测 → 只给运行中的挂 monitor | T2（tmuxinator#658） | 全真 |
 
 `test_integration.sh`：走 `asock tmux-compile`（agent_sock 驱动，
 `TMUX_SOCK_PATH` 模式）跑 bug-hunt，验证驱动链路。

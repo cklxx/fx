@@ -25,7 +25,29 @@ cd tools/tmux_compile
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 python3 -m tmux_compile examples/bug-hunt/dsl.yaml -o /tmp/flow.sh
 bash tests/test_tmux_compile.sh   # 35/35 expected
-bash examples/run_all.sh          # 3 stories expected
+bash examples/run_all.sh          # 6 stories expected
 ```
+
+## Performance
+
+Compiled products eliminate per-step LLM round trips. Measured on 3 stories
+(product-only wall time, clean tmux server):
+
+| story | compiled (incl. one-time compile) | est. LLM-driven (pro profile) | speedup |
+|-------|----------------------------------|------------------------------|---------|
+| bug-hunt | 1.9s | 7.1s | **3.7×** |
+| pr-review | 1.5s | 5.7s | **3.9×** |
+| parallel-dev | 1.9s | 8.0s | **4.3×** |
+
+LLM estimates are honest lower bounds (see `docs/PERFORMANCE.md` §1.2 for method
+and limitations). Rule of thumb: slower model → bigger win (flash ~1.7×,
+slow ~8-10×).
+
+## User cases
+
+`docs/USER_CASES.md`: 29 real scenarios from GitHub issues/PRs/README,
+each with compilability verdict (13 fully / 12 partially / 4 not compilable).
+The three most common out-of-scope lines: unbounded loops, human-in-the-loop
+gates, failure rollback.
 
 See `docs/TMUX_COMPILE_GUIDE.md` for the YAML reference, product contract, and honest limitations.
