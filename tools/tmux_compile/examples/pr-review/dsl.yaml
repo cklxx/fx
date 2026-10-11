@@ -1,0 +1,73 @@
+# Story 1: PR 三审循环 (parallel reviewers -> aggregate -> conditional fix)
+# review.sh / fix.sh are deterministic stand-ins for agent CLIs; everything
+# else (worktrees, parallel panes, artifact files, branching) is real.
+name: pr-review
+params:
+  branch: {required: true}
+  repo: {required: true}
+  helpers: {required: true}
+steps:
+  # phase 1: three reviewers in parallel, one pane each.
+  # Detached worktrees: the same branch cannot be checked out twice.
+  - parallel:
+      legs:
+        - name: security
+          timeout_s: 300
+          steps:
+            - run: |
+                git -C {{repo}} worktree add --detach /tmp/rev-sec {{branch}} 2>/dev/null || true
+                cd /tmp/rev-sec
+                {{helpers}}/review.sh security > /tmp/findings-sec.md 2>&1
+                echo "REVIEW_DONE security"
+              timeout_s: 300
+        - name: api
+          timeout_s: 300
+          steps:
+            - run: |
+                git -C {{repo}} worktree add --detach /tmp/rev-api {{branch}} 2>/dev/null || true
+                cd /tmp/rev-api
+                {{helpers}}/review.sh api > /tmp/findings-api.md 2>&1
+                echo "REVIEW_DONE api"
+              timeout_s: 300
+        - name: tests
+          timeout_s: 300
+          steps:
+            - run: |
+                git -C {{repo}} worktree add --detach /tmp/rev-test {{branch}} 2>/dev/null || true
+                cd /tmp/rev-test
+                {{helpers}}/review.sh tests > /tmp/findings-test.md 2>&1
+                echo "REVIEW_DONE tests"
+              timeout_s: 300
+    timeout_s: 600
+  # phase 2: aggregate. No manual `clear` needed: branch/wait_for see only
+  # the output after this run's anchor. No ERE workaround needed either:
+  # command echo is suppressed, so plain markers are unambiguous.
+  - run: |
+      n=$(grep -l "CRITICAL" /tmp/findings-sec.md /tmp/findings-api.md /tmp/findings-test.md 2>/dev/null | grep -c .)
+      if [ "$n" -gt 0 ]; then echo NEEDS_FIX; else echo ALL_CLEAN; fi
+      grep -h "CRITICAL" /tmp/findings-*.md 2>/dev/null | head -5 || true
+    timeout_s: 60
+  # phase 3: fix on the branch, then re-verify (single re-check, not a loop;
+  # the outer "review again" loop is the caller's job)
+  - branch:
+      if_output_contains: "NEEDS_FIX"
+      then:
+        - run: |
+            cd {{repo}}
+            git checkout -q {{branch}}
+            {{helpers}}/fix.sh
+            echo "FIX_APPLIED"
+          timeout_s: 120
+          assert_exit: 0
+        - run: |
+            cd {{repo}}
+            git checkout -q {{branch}}
+            n=$(grep -r "CRITICAL: hardcoded secret" src/ 2>/dev/null | grep -c .)
+            if [ "$n" -gt 0 ]; then echo STILL_BROKEN; else echo FIX_VERIFIED; fi
+          timeout_s: 60
+        - branch:
+            if_output_contains: "FIX_VERIFIED"
+            then: []
+            else:
+              - fail: fix-ineffective
+      else: []

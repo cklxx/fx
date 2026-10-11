@@ -1,0 +1,56 @@
+# Story 3: Bug 猎杀流水线 (fully real: no test doubles)
+# repro -> git bisect run -> revert culprit -> verify. Fail-fast at each phase.
+name: bug-hunt
+params:
+  repo: {required: true}
+  repro_cmd: {default: "./repro.sh"}
+  test_cmd: {default: "./test.sh"}
+steps:
+  # phase 1: reproduce (fail fast if the bug does not reproduce)
+  - run: |
+      cd {{repo}}
+      {{repro_cmd}} > /tmp/bh-repro.log 2>&1
+      cat /tmp/bh-repro.log
+    timeout_s: 120
+  - branch:
+      if_output_contains: BUG_REPRODUCED
+      then: []
+      else:
+        - fail: cannot-reproduce
+  # phase 2: bisect (non-interactive). CULPRIT passes via /tmp/bh-culprit.txt.
+  # Plain marker: command echo is suppressed, so `echo CULPRIT_FOUND` can't
+  # false-match the command text. The -s check validates a real hash landed.
+  - run: |
+      cd {{repo}}
+      git bisect start HEAD HEAD~19 --
+      git bisect run {{test_cmd}} > /tmp/bh-bisect.log 2>&1
+      grep -oE '[0-9a-f]{40}' /tmp/bh-bisect.log | tail -1 > /tmp/bh-culprit.txt
+      git bisect reset
+      if [ -s /tmp/bh-culprit.txt ]; then echo CULPRIT_FOUND; else echo NO_CULPRIT; fi
+    timeout_s: 600
+  - branch:
+      if_output_contains: "CULPRIT_FOUND"
+      then: []
+      else:
+        - fail: bisect-found-nothing
+  # phase 3: fix = reverse-apply the culprit's diff to app.sh (real fix)
+  - run: |
+      cd {{repo}}
+      CULPRIT=$(cat /tmp/bh-culprit.txt)
+      git show "$CULPRIT" -- app.sh | git apply -R --whitespace=nowarn
+      echo "FIX_APPLIED $CULPRIT"
+    timeout_s: 120
+    assert_exit: 0
+  # phase 4: verify on the same pane (closed loop). No manual `clear`:
+  # matchers see only this run's output, so phase-1's BUG_REPRODUCED
+  # cannot leak in.
+  - run: |
+      cd {{repo}}
+      {{repro_cmd}} > /tmp/bh-verify.log 2>&1
+      cat /tmp/bh-verify.log
+    timeout_s: 120
+  - branch:
+      if_output_contains: BUG_REPRODUCED
+      then:
+        - fail: fix-ineffective
+      else: []
