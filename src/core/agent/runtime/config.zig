@@ -64,6 +64,10 @@ pub const Config = struct {
     /// succeed with no decision-relevant output. Only for non-interactive
     /// `fx ask` mode. Saves one TTFT per turn.
     skip_confirm_round: bool = false,
+    /// Slim tool schemas in LLM requests: trim "When NOT to use" from function
+    /// descriptions and skip property descriptions. Reduces request body by
+    /// ~23%, lowering TTFT. Only for non-interactive `fx ask` mode.
+    slim_tool_schemas: bool = false,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
