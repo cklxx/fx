@@ -14,7 +14,7 @@ fx aims to be the fastest coding agent. The performance work has three parts:
 
 - `tmux_compile/` — the compiler package (`python3 -m tmux_compile flow.yaml -o flow.sh`)
 - `tests/` — acceptance suite (`test_tmux_compile.sh`, 35 tests) and soak test
-- `examples/` — three end-to-end stories on real git repos: bug-hunt, pr-review, parallel-dev
+- `examples/` — six end-to-end stories on real git repos: bug-hunt, pr-review, parallel-dev
 - `docs/` — analysis, acceptance criteria, user guide (`TMUX_COMPILE_GUIDE.md`)
 - `demo.sh` — two-minute demo
 
@@ -40,7 +40,7 @@ Compiled products eliminate per-step LLM round trips. Measured on 3 stories
 | parallel-dev | 1.9s | 8.0s | **4.3×** |
 
 LLM estimates are honest lower bounds (see `docs/PERFORMANCE.md` §1.2 for method
-and limitations). Rule of thumb: slower model → bigger win (flash ~1.7×,
+and limitations). Rule of thumb: slower model → bigger win (real flash models ~2.6–4.1×,
 slow ~8-10×).
 
 ## User cases

@@ -1,7 +1,7 @@
 # fx src 端到端优化计划（v2）
 
 > 分支：`bench/speed-opt`。基准：E2E_ANALYSIS.md（TTFT 占 80–89%，模型 API 占 91–99%）。
-> 工具链：Zig 0.16.0（`~/workspace/agent-sock/zig/toolchain/zig`）。全量构建 ~67s，单文件增量 ~51s。
+> 工具链：Zig 0.16.0（见仓库根目录 `AGENTS.md` 的 Language and Toolchain 节）。
 >
 > v2 修订（2026-10-11）：删掉 `tool_choice: required`（hack，逻辑错误）；
 > 新增二八分析；确认轮消除升为 P1。
