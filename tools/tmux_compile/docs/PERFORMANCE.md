@@ -26,7 +26,9 @@ LLM_estimate = product_time + N_rounds × (TTFT + streaming_per_round)
 - `product_time`：实测的编译产物执行时间（§2），代表"干活本身"的时间
 - `N_rounds`：估算的 LLM 轮数（§3，每 story 说明依据）
 - `TTFT` / `streaming_per_round`：来自 `benchmarks/agent-bench/E2E_ANALYSIS.md`
-  的实测 sim-server 数据（P1 优化后，P3 瘦身后 prompt）：
+  的实测 sim-server 数据（**注意**：该数据取自 P1/P3 提交之前的 27KB 完整 prompt，
+  E2E_ANALYSIS.md 生成于 10-11 04:55，早于 P1 提交 05:20 和 P3 提交 08:29；
+  不是"P3 瘦身后"的 19KB prompt）：
 
 | profile | TTFT/round | streaming/round | 每轮合计 |
 |---------|-----------|----------------|---------|
@@ -38,7 +40,9 @@ LLM_estimate = product_time + N_rounds × (TTFT + streaming_per_round)
 - N_rounds 是人工估算，真实 agent 可能多 1-2 轮（试错）或少 1 轮（合并操作）
 - 假设 LLM 每轮都能一次做对，不考虑 LLM 犯错重试（真实只会更慢）
 - inter-round 的 tool 调度开销（~8ms/轮）已包含在 product_time 的 tmux 操作里，不重复计算
-- 因此这是**对 LLM 有利的下限估算**，真实加速比只会更大
+- TTFT 基于瘦身前 27KB prompt，LLM 驱动侧时间被高估，按 P3 后 19KB prompt
+  重测（待定）后真实加速比会低于当前数字；因此下表不是"对 LLM 有利的下限"，
+  而是偏高估算，真实值只会更小
 
 ### 1.3 编译时间
 
