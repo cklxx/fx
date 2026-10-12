@@ -1,0 +1,23 @@
+# Demo: validate a tool's output content, retry until it is complete.
+# Run:  cd tools/retry && rm -f /tmp/retry-demo-count report.md
+#       && RETRY_STATE=/tmp/retry-demo-count \
+#          python3 -m retry examples/spec.yaml
+command: "sh examples/flaky_report.sh"
+cwd: "."
+env:
+  RETRY_STATE: /tmp/retry-demo-count
+retry:
+  max_attempts: 5
+  backoff: fixed
+  base_delay_s: 0.2
+  jitter: false
+validators:
+  - type: exit_code
+    expect: 0
+  - type: file_exists
+    path: report.md
+    name: report-written
+  - type: pattern
+    name: report-complete
+    pattern: "complete"
+    stream: stdout
