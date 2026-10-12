@@ -63,19 +63,24 @@
 - 请求体解析：取 `messages` 最后一个 user/tool 消息的摘要记入 timing 日志（不做语义理解——语义由"剧本模式"接管）。
 
 ### 3.2 Rate profile（可配置）
-CLI：`sim-server --profile <name> [--profile-json <file>] [--script <file>] [--timing-log <file>] [--port N]`
+CLI：`sim-server --profile <name> [--profile-json <file>] [--script <file>] [--timing-log <file>] [--port N] [--jitter pct] [--dump-bodies dir]`
 
-| profile | TTFT | TPOT | 失败注入 | 429 概率 | 说明 |
+计时模型为 prefill/decode 分离：`TTFT = ttft_fixed_ms + (1 − hit_ratio) × prompt_tokens / prefill_tps`，`TPOT = 1000 / decode_tps`。prompt_tokens 按请求体字节数 /4 估算。旧档的 prefill/decode 速率按 benchmark 实测 prompt 量（~6700 tokens）标定，使无缓存 TTFT/TPOT 与旧固定值一致。
+
+| profile | prefill | decode | 前缀缓存 | 失败注入 | 说明 |
 |---|---|---|---|---|---|
-| `flash` | 200ms | 8ms/token | 0 | 0 | 快模型上限参考 |
-| `pro` | 800ms | 25ms/token | 0 | 0 | 主力模型参考 |
-| `slow` | 2000ms | 80ms/token | 0 | 0 | 慢模型/拥塞参考 |
-| `flaky` | 800ms | 25ms/token | 5%（500） | 5%（429+Retry-After） | 考验 agent 重试/恢复 |
+| `flash` | 42000 tok/s | 125 tok/s | 关 | 0 | 快模型上限参考（TTFT≈200ms） |
+| `pro` | 8800 tok/s | 40 tok/s | 关 | 0 | 主力模型参考（TTFT≈800ms） |
+| `slow` | 3440 tok/s | 12.5 tok/s | 关 | 0 | 慢模型/拥塞参考（TTFT≈2000ms） |
+| `flaky` | 8800 tok/s | 40 tok/s | 关 | 5%（500）+5%（429） | 考验 agent 重试/恢复 |
+| `zero` | — | — | 关 | 0 | TTFT/TPOT=0，纯 harness 开销测量 |
+| `ultrafast` | 5000 tok/s | 1000 tok/s | 开（真实 LCP） | 0 | 高性能推理：首轮冷启动，后续轮按真实前缀命中 |
+| `cached` | 5000 tok/s | 1000 tok/s | 开（强制 95%） | 0 | 稳态缓存轮：system prompt + tool 定义近全命中 |
 | 自定义 | JSON 指定 | JSON 指定 | JSON 指定 | JSON 指定 | `--profile-json` |
 
-- TTFT：收到请求后、首个 SSE chunk 前 sleep。
-- TPOT：每个 token chunk 间 sleep；token 按"每 ~4 字符一切"模拟（与计时口径一致即可，不求精确分词）。
-- 失败注入：按概率直接返回 500（可重试）或 429（带 `Retry-After: 1`），harness 计"API 错误次数"。
+- 前缀缓存：请求体规范化为 `tools JSON ++ 0x00 ++ messages JSON` 后按 64 字节分块做 FNV-1a 哈希，与上一请求的最长公共前缀即命中部分。`prefix_hit_pct=-1` 按真实 LCP，0–100 强制指定比率。
+- 结构性约束：共享池只存 prefill KV（decode 产物永不入库）；最后一个 prompt token 恒为 miss。命中率恒小于 100%。
+- `--profile-json` 可指定全部字段：`prefill_tps`、`decode_tps`、`ttft_fixed_ms`、`prefix_cache`、`prefix_hit_pct`（另见 6.2 节对照表）。
 - `--jitter <pct>`：给 TTFT/TPOT 加抖动（默认 10%），避免全同步假象。
 
 ### 3.3 剧本模式（给轨迹回放用）
@@ -96,10 +101,10 @@ CLI：`sim-server --profile <name> [--profile-json <file>] [--script <file>] [--
 ### 3.4 Timing 日志（JSONL，每行一个请求）
 ```json
 {"t_start_ms": 1712345678901, "t_first_chunk_ms": 1712345679105, "t_end_ms": 1712345679230,
- "ttft_ms": 204, "tokens": 42, "profile": "flash", "req_seq": 3,
- "status": 200, "script_hit": true, "req_bytes": 12345, "prompt_summary": "tool result: ..."}
+ "ttft_ms": 204, "tokens": 42, "profile": "flash", "req_seq": 3, "status": 200,
+ "prompt_tokens": 6697, "prefix_hit_tokens": 6362, "prefix_hit_ratio_pct": 95, "prefill_ms": 67}
 ```
-harness 用它算：LLM round 次数、token 总量、模型侧耗时占比。
+harness 用它算：LLM round 次数、token 总量、模型侧耗时占比、前缀命中率。新增字段向后兼容（旧日志缺失时按 0 处理）。
 
 ---
 

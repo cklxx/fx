@@ -151,6 +151,11 @@ async function runOne(profile, taskId, rep) {
       // For now: ttftc = wallMs - modelMs - (time after last response). Use first ttft.
       ttftcMs = timing[0].ttft_ms;
     }
+    const okTiming = timing.filter((r) => r.status === 200);
+    const prefixHitPct = okTiming.length
+      ? okTiming.reduce((s, r) => s + (r.prefix_hit_ratio_pct || 0), 0) / okTiming.length
+      : null;
+    const prefillMs = okTiming.reduce((s, r) => s + (r.prefill_ms || 0), 0);
     return {
       profile, task: taskId, rep,
       wall_ms: Math.round(wallMs),
@@ -161,6 +166,8 @@ async function runOne(profile, taskId, rep) {
       harness_ms: Math.round(wallMs - modelMs),
       api_errors: apiErrors,
       success,
+      prefix_hit_pct: prefixHitPct == null ? null : Math.round(prefixHitPct),
+      prefill_ms: prefillMs,
       steps: json?.steps ?? null,
       tool_calls: (json?.tool_calls || []).map((t) => t.name),
     };
@@ -207,17 +214,19 @@ async function main() {
   // Summary table: profile x task -> wall_ms stats + success rate
   let md = `# agent-bench results\n\nGenerated: ${new Date().toISOString()}\n`;
   md += `Profiles: ${effProfiles.join(", ")} | Tasks: ${tasks.join(", ")} | Reps: ${effReps}\n\n`;
-  md += `| profile | task | n | wall mean (ms) | wall p50 (ms) | harness mean (ms) | rounds | success |\n`;
-  md += `|---|---|---|---|---|---|---|---|\n`;
+  md += `| profile | task | n | wall mean (ms) | wall p50 (ms) | harness mean (ms) | rounds | prefix hit% | success |\n`;
+  md += `|---|---|---|---|---|---|---|---|---|\n`;
   for (const profile of effProfiles) {
     for (const task of tasks) {
       const rs = runs.filter((r) => r.profile === profile && r.task === task && !r.error);
       const walls = rs.map((r) => r.wall_ms);
       const harn = rs.map((r) => r.harness_ms);
       const rounds = rs.map((r) => r.llm_rounds);
+      const hits = rs.map((r) => r.prefix_hit_pct).filter((v) => v != null);
       const st = stats(walls), sh = stats(harn), sr = stats(rounds);
       const succ = rs.filter((r) => r.success).length;
-      md += `| ${profile} | ${task} | ${rs.length} | ${st.mean ?? "-"} | ${st.p50 ?? "-"} | ${sh.mean ?? "-"} | ${sr.mean ?? "-"} | ${succ}/${rs.length} |\n`;
+      const hitStr = hits.length ? Math.round(hits.reduce((a, b) => a + b, 0) / hits.length) + "%" : "-";
+      md += `| ${profile} | ${task} | ${rs.length} | ${st.mean ?? "-"} | ${st.p50 ?? "-"} | ${sh.mean ?? "-"} | ${sr.mean ?? "-"} | ${hitStr} | ${succ}/${rs.length} |\n`;
     }
   }
   md += `\n## Notes\n\n- wall_ms: spawn to exit. harness_ms: wall_ms - model_ms (model-side SSE time).\n- ttftc_ms: first-chunk latency of first LLM request (from sim timing log).\n`;
