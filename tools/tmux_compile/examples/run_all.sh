@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run all tmux_compile stories. Exit nonzero on any failure.
-# (The asock driver integration test lives in agent-sock, it needs agent_sock.)
+# (The asock driver integration test lives in tools/sock/agent_sock.)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pass=0; fail=0

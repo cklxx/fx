@@ -14,7 +14,7 @@ fx aims to be the fastest coding agent. The performance work has three parts:
 
 - `tmux_compile/` — the compiler package (`python3 -m tmux_compile flow.yaml -o flow.sh`)
 - `tests/` — acceptance suite (`test_tmux_compile.sh`, 35 tests) and soak test
-- `examples/` — six end-to-end stories on real git repos: bug-hunt, pr-review, parallel-dev
+- `examples/` — nine end-to-end stories on real git repos: bug-hunt, pr-review, parallel-dev
 - `docs/` — analysis, acceptance criteria, user guide (`TMUX_COMPILE_GUIDE.md`)
 - `demo.sh` — two-minute demo
 
@@ -25,7 +25,7 @@ cd tools/tmux_compile
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 python3 -m tmux_compile examples/bug-hunt/dsl.yaml -o /tmp/flow.sh
 bash tests/test_tmux_compile.sh   # 35/35 expected
-bash examples/run_all.sh          # 6 stories expected
+bash examples/run_all.sh          # 9 stories expected
 ```
 
 ## Performance
