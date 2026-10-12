@@ -22,11 +22,11 @@ def spec(**kw):
 
 class TestCel(unittest.TestCase):
     def test_known_vars(self):
-        cel_check("steps.build.failed", {"steps"})
+        cel_check("steps.build.failed", {"steps"}, {"build"})
 
     def test_unknown_var(self):
         with self.assertRaises(errors.ErrorPacket):
-            cel_check("steps.nope.failed", {"steps"})
+            cel_check("steps.nope.failed", {"steps"}, {"build"})
 
     def test_illegal_chars(self):
         with self.assertRaises(errors.ErrorPacket):

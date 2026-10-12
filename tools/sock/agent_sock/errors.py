@@ -45,8 +45,8 @@ KNOWN_CODES = frozenset(CODE_TO_DEFAULT)
 
 
 @dataclass
-class ErrorPacket:
-    """§6.1 错误包。"""
+class ErrorPacket(Exception):
+    """§6.1 错误包。也是异常：raise errors.make(...) / except ErrorPacket 均可用。"""
     code: str
     message: str
     severity: str = "error"  # error | fatal
@@ -60,6 +60,8 @@ class ErrorPacket:
     def __post_init__(self):
         if self.code not in KNOWN_CODES:
             raise ValueError(f"unknown error code: {self.code}")
+        # 让 str(e) / traceback 打印出 code: message；否则 except 后日志为空。
+        super().__init__(f"{self.code}: {self.message}")
 
     def to_dict(self) -> dict:
         d = {

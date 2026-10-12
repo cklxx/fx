@@ -39,10 +39,11 @@ class TestDeliverFifo(Base):
         self.q.consume("c2", "g")
         mid = self.pub(1)
         d1 = self.q.deliver("g")
-        # c1 拿到后 pending，c2 的 deliver 应拿到"下一条"而非同一条
+        # deliver 在 pending 最少的成员间选择；c1/c2 均为 0 pending，
+        # 谁拿到取决于集合序（未定义），但恰好一人拿到且 d2 为空。
         d2 = self.q.deliver("g")
-        self.assertIsNone(d2)  # 只有一条消息，已被 c1 持有
-        self.assertEqual(d1.pend_consumer, "c1")
+        self.assertIsNone(d2)  # 只有一条消息，已被持有
+        self.assertIn(d1.pend_consumer, ("c1", "c2"))
 
     def test_idempotent_publish(self):
         m1, _ = self.q.publish("dup", b"x")

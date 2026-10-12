@@ -33,10 +33,15 @@ _CEL_ALLOWED = re.compile(
     r"^[a-zA-Z0-9_.\s()=!<>\"'&|+-/*]+$")
 
 
-def cel_check(expr: str, known_vars: set[str]) -> None:
-    """编译期检查：字符白名单 + 变量引用存在性。"""
+def cel_check(expr: str, known_vars: set[str], step_ids=()) -> None:
+    """编译期检查：字符白名单 + 变量引用存在性。
+
+    steps.<id>.failed|ok 中的 <id> 须是已知步骤；调用方传入 step_ids 才检查
+    （不传时无法判断，保持旧行为只查 root）。
+    """
     if not _CEL_ALLOWED.match(expr):
         raise errors.make("APIPE-1001", f"CEL illegal chars: {expr!r}")
+    step_idset = set(step_ids)
     for var in _CEL_VAR.findall(expr):
         root = var.split(".")[0]
         if root in ("true", "false", "and", "or", "not"):
@@ -44,6 +49,11 @@ def cel_check(expr: str, known_vars: set[str]) -> None:
         if root not in known_vars:
             raise errors.make("APIPE-1001",
                               f"CEL unknown variable: {var} in {expr!r}")
+        if root == "steps" and step_idset:
+            parts = var.split(".")
+            if len(parts) >= 2 and parts[1] not in step_idset:
+                raise errors.make("APIPE-1001",
+                                  f"CEL unknown step: {var} in {expr!r}")
 
 
 def cel_to_bash(expr: str) -> str:
@@ -90,12 +100,14 @@ class Pipeline:
             raise errors.make("APIPE-1001", "duplicate step id")
         idset = set(ids)
         for s in self.steps:
+            # {{var}} 未定义在构造期就报错，不等到 compile_bash。
+            self._expand_vars(s.run)
             for n in s.needs:
                 if n not in idset:
                     raise errors.make("APIPE-1001",
                                       f"step {s.id} needs unknown {n}")
             if s.when:
-                cel_check(s.when, {"steps"} | set(self.vars))
+                cel_check(s.when, {"steps"} | set(self.vars), idset)
             if s.effect == "llm" and not s.checkpoint:
                 raise errors.make("APIPE-1001",
                                   f"effect:llm step {s.id} requires checkpoint")

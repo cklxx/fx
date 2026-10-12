@@ -7,7 +7,8 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-FXTC="${FX_TMUX_COMPILE:-$HOME/workspace/fx-fork/tools/tmux_compile}"
+FXROOT="$(cd "$HERE/../../.." && pwd)"
+FXTC="${FX_TMUX_COMPILE:-$FXROOT/tools/tmux_compile}"
 export PYTHONPATH="$ROOT:$FXTC${PYTHONPATH:+:$PYTHONPATH}"
 WORK=/tmp/tc-stories/bug-hunt
 

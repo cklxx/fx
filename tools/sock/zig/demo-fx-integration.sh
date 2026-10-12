@@ -12,7 +12,8 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZIG_OUT="$SCRIPT_DIR/zig-out/bin"
-FX_TOOLS="$HOME/workspace/fx-fork/benchmarks/agent-bench/.tools"
+FXROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+FX_TOOLS="${FX_TOOLS:-$FXROOT/benchmarks/agent-bench/.tools}"
 DEMO_DIR="${DEMO_DIR:-/tmp/fx-integration-demo}"
 
 log() { echo "[demo] $*" >&2; }
