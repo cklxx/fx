@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+zig-out/
+zig-cache/
+.zig-cache/
+*.o
+node_modules/
+.DS_Store
+*.log
+/tmp/
+zig/toolchain/
+*.pid
