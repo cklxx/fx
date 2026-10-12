@@ -122,7 +122,7 @@ pub fn writeBuiltinFunctionSchema(
     const description = try cappedDescriptionAlloc(alloc, schema.description);
     defer alloc.free(description);
     try writeFunctionSchemaOpen(writer, schema.name, description);
-    try writeObjectSchema(alloc, writer, schema.input_schema);
+    try writeObjectSchema(alloc, writer, schema.input_schema, slim);
     try writer.writeByte('}');
 }
 
@@ -153,6 +153,7 @@ pub fn writeObjectSchema(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     schema: ObjectSchema,
+    slim: bool,
 ) anyerror!void {
     if (schema.one_of.len > 0) {
         if (schema.properties.len > 0 or
@@ -166,7 +167,7 @@ pub fn writeObjectSchema(
         try writer.writeAll("{\"oneOf\":[");
         for (schema.one_of, 0..) |alternative, index| {
             if (index > 0) try writer.writeByte(',');
-            try writeObjectSchema(alloc, writer, alternative);
+            try writeObjectSchema(alloc, writer, alternative, slim);
         }
         try writer.writeAll("]}");
         return;
@@ -177,7 +178,7 @@ pub fn writeObjectSchema(
         if (index > 0) try writer.writeByte(',');
         try std.json.Stringify.value(property.name, .{}, writer);
         try writer.writeByte(':');
-        try writePropertySchema(alloc, writer, property);
+        try writePropertySchema(alloc, writer, property, slim);
     }
     try writer.writeByte('}');
     if (schema.additional_properties) |value| {
@@ -201,11 +202,12 @@ fn writePropertySchema(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     property: Property,
+    slim: bool,
 ) anyerror!void {
     if (property.shape) |shape| {
         switch (shape.*) {
             .object => |object_schema| {
-                try writeObjectSchema(alloc, writer, object_schema.*);
+                try writeObjectSchema(alloc, writer, object_schema.*, slim);
                 return;
             },
             else => {},
@@ -231,13 +233,13 @@ fn writePropertySchema(
     if (bounds.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{bounds.max_length});
     if (bounds.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{bounds.minimum});
     if (bounds.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{bounds.maximum});
-    // P3 schema slimming: skip property descriptions to reduce request body.
-    // Param names + types + required fields carry the essential info.
-    // If model misuses params, revert this change.
-    // if (property.description.len > 0) {
-    //     try writer.writeAll(",\"description\":");
-    //     try writeCappedDescriptionJsonString(alloc, writer, property.description);
-    // }
+    // P3 schema slimming: skip property descriptions to reduce request body
+    // when slim is enabled. Param names + types + required fields carry the
+    // essential info. If model misuses params, revert this change.
+    if (!slim and property.description.len > 0) {
+        try writer.writeAll(",\"description\":");
+        try writeCappedDescriptionJsonString(alloc, writer, property.description);
+    }
     if (bounds.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{bounds.min_items});
     if (bounds.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{bounds.max_items});
     if (property.shape) |shape| {
@@ -257,7 +259,7 @@ fn writePropertySchema(
             },
             .array_objects => |items| {
                 try writer.writeAll(",\"items\":");
-                try writeObjectSchema(alloc, writer, items.*);
+                try writeObjectSchema(alloc, writer, items.*, slim);
             },
             else => {},
         }

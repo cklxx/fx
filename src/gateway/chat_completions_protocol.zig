@@ -598,10 +598,14 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
             try std.json.Stringify.value(function.name, .{}, writer);
             try writer.writeAll(",\"description\":");
-            try writeTrimmedDescription(alloc, writer, function.description);
+            if (options.slim_tool_schemas) {
+                try writeTrimmedDescription(alloc, writer, function.description);
+            } else {
+                try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description);
+            }
             try writer.writeAll(",\"parameters\":");
             switch (function.schema) {
-                .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
+                .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema, options.slim_tool_schemas),
                 .dynamic => |schema| try std.json.Stringify.value(schema, .{}, writer),
             }
             try writer.writeAll("}}");

@@ -338,8 +338,15 @@ def emit_bash(name, steps, source, count_actions):
     out.append("# --- tmux address: -S path mode (agent_sock driver) wins over -L name ---")
     out.append('if [ -n "${TMUX_SOCK_PATH:-}" ]; then')
     out.append('  _TADDR=(-S "$TMUX_SOCK_PATH")')
-    # _sig_addr is baked literally: the pane's shell cannot call _tmux.
-    out.append('  _sig_addr="tmux -S \\"$TMUX_SOCK_PATH\\""')
+    # B3 fix: TMUX_SOCK_PATH allowlist (defense in depth, symmetric with TSOCK).
+    # Paths may contain / in addition to TSOCK's charset.
+    out.append(
+        '  case "$TMUX_SOCK_PATH" in *[!A-Za-z0-9._/-]*) echo "COMPILE-FAIL reason=bad-sock-path" >&2; exit 20;; esac'
+    )
+    # B3 fix: use printf %q for fundamental quoting safety. The old
+    # `_sig_addr="tmux -S \"$TMUX_SOCK_PATH\""` allowed injection via
+    # embedded quotes/$()/backticks when the product shell expanded it.
+    out.append('  _sig_addr="$(printf \'tmux -S %q\' "$TMUX_SOCK_PATH")"')
     out.append("else")
     out.append(
         '  if [ -z "${TSOCK:-}" ]; then echo "COMPILE-FAIL reason=missing-env:TSOCK" >&2; exit 20; fi'

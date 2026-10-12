@@ -800,6 +800,36 @@ EOF
   _end_tmux; rm -rf "$work"
 }
 
+# B3: TMUX_SOCK_PATH injection via _sig_addr must be blocked.
+# The product must reject malicious paths via allowlist and use
+# printf %q for fundamental quoting safety.
+t_a22() {
+  local work; work=$(mktemp -d)
+  cat > "$work/dsl.yaml" <<'EOF'
+name: a22
+steps:
+  - run: "echo hello"
+  - wait_for: "hello"
+EOF
+  _compile "$work/dsl.yaml" "$work/product.sh" >/dev/null 2>&1 \
+    || { _tfail "A22" "compile failed"; rm -rf "$work"; return; }
+
+  # 1. malicious path must be rejected by allowlist
+  local marker="$work/pwned"
+  rm -f "$marker"
+  TMUX_SOCK_PATH='/tmp/foo"; touch "$marker"; echo "' TSOCK="" PANE="dummy:0.0" \
+    bash "$work/product.sh" 2>&1 | grep -q "bad-sock-path" \
+    || { _tfail "A22" "malicious TMUX_SOCK_PATH not rejected"; rm -rf "$work"; return; }
+  [ -f "$marker" ] && { _tfail "A22" "injection executed"; rm -rf "$work"; return; }
+
+  # 2. product must use printf %q for _sig_addr construction
+  grep -q "printf 'tmux -S %q'" "$work/product.sh" \
+    || { _tfail "A22" "printf %q not found in product"; rm -rf "$work"; return; }
+
+  _tpass "A22"
+  rm -rf "$work"
+}
+
 # ---------------------------------------------------------------- run all
 t_a1
 t_a2
@@ -821,6 +851,7 @@ t_a18
 t_a19
 t_a20
 t_a21
+t_a22
 
 echo "----------------------------------------"
 echo "PASS=$PASS FAIL=$FAIL"

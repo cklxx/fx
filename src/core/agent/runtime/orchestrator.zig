@@ -11994,12 +11994,19 @@ fn processQueuedPromptLoop(
             &step_batch,
         );
         // P1: Skip the model confirmation round when all tools succeeded with
-        // no decision-relevant output. The model has no new information to act
-        // on, so the confirmation round is pure overhead (one TTFT).
+        // no decision-relevant output and the model gave no text alongside the
+        // tool calls. The model has no new information to act on, so the
+        // confirmation round is pure overhead (one TTFT).
+        // B1 fix: if the model wrote text alongside the tool calls, it may be
+        // describing a multi-step plan ("write file then run tests"). Ending
+        // the turn here would silently truncate the plan. Only skip when the
+        // assistant message was empty.
+        const assistant_text_empty = std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0;
         if (config.skip_confirm_round and
             step_batch.step_total_count > 0 and
             step_batch.step_error_count == 0 and
-            !step_batch.step_had_decision_output)
+            !step_batch.step_had_decision_output and
+            assistant_text_empty)
         {
             debug_trace.eventf("agent", "skip_confirm_round", step_ctx, "tool_count={d}", .{step_batch.step_total_count});
             const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = null };

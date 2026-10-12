@@ -2654,7 +2654,9 @@ fn writeFunctionTool(
     }
     try writer.writeAll(",\"parameters\":");
     switch (input_schema) {
-        .static => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
+        // B2: slim only applies to ask mode (chat_completions). Responses
+        // protocol always uses full schemas.
+        .static => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema, false),
         .dynamic => |schema| {
             if (schema != .object) return error.InvalidToolSchema;
             try std.json.Stringify.value(schema, .{}, writer);
