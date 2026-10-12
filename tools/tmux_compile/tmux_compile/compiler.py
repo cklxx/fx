@@ -390,6 +390,18 @@ def _parse_parallel(vnode, mods, line, declared):
                 raise _err(k, "unknown leg key '%s' (expected: name, steps, timeout_s)" % ks)
         if not name or not name.strip():
             raise _err(ln, "leg missing 'name'")
+        # Leg names are embedded raw in COMPILE-FAIL echo lines (double-quoted
+        # shell), so restrict the charset at parse time. {{param}} placeholders
+        # are probed as a single safe char; the strict check re-runs after
+        # substitution in _subst_steps (a param value could smuggle
+        # metacharacters). This matches the TSOCK allowlist style used by
+        # the emitted product.
+        probe = PARAM_RE.sub("P", name)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", probe):
+            raise _err(
+                ln,
+                "leg name '%s' must match [A-Za-z0-9._-]+ (shell-embedded)" % name,
+            )
         if name in seen_names:
             raise _err(ln, "duplicate leg name '%s'" % name)
         seen_names.add(name)
@@ -564,6 +576,15 @@ def _subst_steps(steps, values):
                 if not leg["name"].strip():
                     raise CompileError(
                         "leg name became empty after param substitution",
+                        leg["line"],
+                    )
+                # Re-check the charset post-substitution: a param value could
+                # otherwise smuggle shell metacharacters past the parse-time
+                # check (leg names are embedded raw in COMPILE-FAIL lines).
+                if not re.fullmatch(r"[A-Za-z0-9._-]+", leg["name"]):
+                    raise CompileError(
+                        "leg name '%s' must match [A-Za-z0-9._-]+ after"
+                        " param substitution (shell-embedded)" % leg["name"],
                         leg["line"],
                     )
                 _subst_steps(leg["steps"], values)

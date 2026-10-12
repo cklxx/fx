@@ -105,12 +105,27 @@ def _emit_branch(st, out, counter, tag, ind):
     out.append(ind + "fi")
 
 
+def _sh_dquote(s):
+    """Escape a string for embedding inside double quotes in the product.
+
+    The fail reason is author-controlled DSL text; without escaping,
+    $(...)/backticks/`` ` ``/ would execute in the product shell (the old
+    code only neutralized double quotes). Backslash first: order matters.
+    """
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+        .replace("!", "\\!")
+    )
+
+
 def _emit_fail(st, out, counter, tag, ind):
     counter[0] += 1
     n = counter[0]
     out.append("%s# --- step %d: fail (line %d) ---" % (ind, n, st["line"]))
-    # reason is compiler-controlled text; quote defensively anyway
-    safe_reason = st["reason"].replace('"', "'")
+    safe_reason = _sh_dquote(st["reason"])
     out.append(
         ind + 'echo "COMPILE-FAIL %sstep=%d reason=%s dsl_line=%d" >&2'
         % (tag, n, safe_reason, st["line"])
