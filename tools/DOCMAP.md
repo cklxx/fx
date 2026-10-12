@@ -9,14 +9,14 @@
 
 | 文档 | 一句话 | 给谁看 | 时效性 |
 |------|--------|--------|--------|
-| `README.md`（根） | 项目入口：关系图、快速开始、性能表 | 开发者/用户 | 有效（2026-10-13 修正 2 处过时数字） |
+| `README.md`（根） | 项目入口：关系图、快速开始、性能表 | 开发者/用户 | 有效（2026-10-13 修正过时数字与故事数 6→9） |
 | `docs/TMUX_COMPILE_GUIDE.md` | 用户手册：YAML 语法、产物契约、已知限制 | 用户 | 有效 |
 | `docs/USER_CASES.md` | 29 个真实场景的可编译性裁定库 | 开发者 | 有效 |
 | `docs/PERFORMANCE.md` | 编译产物 vs LLM 驱动的加速比实测与方法 | 开发者/评审 | 有效（§1.2 自标"偏高估算"，§5 有真实 trace 修正） |
 | `docs/TRACE_VALIDATION.md` | 120 万 tool 调用的真实 trace 联合验证 | 开发者 | 有效（最新，2026-10-12/13） |
 | `docs/TMUX_COMPILE_ANALYSIS.md` | 可编译性条件与失败模式的可行性分析 | 开发者 | 历史（设计前分析，结论已沉淀进 GUIDE §7） |
 | `docs/TMUX_COMPILE_ACCEPTANCE.md` | 验收与体验设计（35 测试、用户故事） | 开发者 | 历史（验收已通过，2026-10-11） |
-| `examples/README.md` | 六个用户故事的说明 | 开发者 | 有效 |
+| `examples/README.md` | 九个用户故事的说明 | 开发者 | 有效（2026-10-13 补 3 个 trace 故事行） |
 
 ### 1.2 tools/sock/（Agent Sock 协议）
 
