@@ -2,7 +2,7 @@
 # e2e for story 3: setup -> compile -> run -> assert. All real, no mocks.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 WORK=/tmp/tc-stories/bug-hunt
 

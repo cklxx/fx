@@ -3,7 +3,7 @@
 # Also covers the panic path via a variant DSL run (flag pre-created).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 WORK=/tmp/tc-stories/retry-until-ready
 

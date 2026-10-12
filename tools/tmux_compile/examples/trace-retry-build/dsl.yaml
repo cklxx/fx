@@ -1,0 +1,20 @@
+# Trace-derived: error -> retry pattern (TRACE_VALIDATION.md §5)
+# Real trace: 802 sessions (39.2%) retry the same tool after error outcome.
+# Uses the retry: primitive instead of N LLM round-trips.
+name: trace-retry-build
+params:
+  workdir: {required: true}
+steps:
+  - retry:
+      attempts: 3
+      delay_s: 2
+      until_exit_zero: true
+      steps:
+        - run: |
+            cd {{workdir}}
+            ./build.sh
+          timeout_s: 120
+  - run: |
+      cd {{workdir}}
+      echo "BUILD_OK"
+    timeout_s: 30

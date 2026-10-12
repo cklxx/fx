@@ -2,7 +2,7 @@
 # e2e for T2: pipeline-server + redis-cache get monitors, search-api is skipped.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 WORK=/tmp/tc-stories/conditional-setup
 

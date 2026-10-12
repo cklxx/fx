@@ -1,0 +1,21 @@
+# Trace-derived: conditional branch on command output (TRACE_VALIDATION.md §5)
+# Real pattern: run health check -> branch on output -> deploy or abort.
+# Replaces 2-3 LLM rounds (check, decide, act) with 1 compiled run.
+name: trace-branch-deploy
+params:
+  workdir: {required: true}
+steps:
+  - run: |
+      cd {{workdir}}
+      ./healthcheck.sh
+    timeout_s: 60
+  - branch:
+      if_output_contains: "HEALTHY"
+      then:
+        - run: |
+            cd {{workdir}}
+            ./deploy.sh
+            echo "DEPLOYED"
+          timeout_s: 120
+      else:
+        - fail: unhealthy-abort

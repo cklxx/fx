@@ -1,0 +1,20 @@
+# Trace-derived: iterative debug loop (TRACE_VALIDATION.md §5, pattern 1)
+# Real trace: 6 consecutive `python ... 2>&1 | head -N` runs in one session,
+# each an LLM round-trip. Compiles N rounds into 1 product run.
+name: trace-iterative-test
+params:
+  workdir: {required: true}
+steps:
+  - run: |
+      cd {{workdir}}
+      for i in 1 2 3; do
+        echo "--- iter $i ---"
+        ITER=$i python3 app.py 2>&1 | head -40
+      done
+      echo "ITERS_DONE"
+    timeout_s: 60
+  - branch:
+      if_output_contains: "ITERS_DONE"
+      then: []
+      else:
+        - fail: iters-incomplete

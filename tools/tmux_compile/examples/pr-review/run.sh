@@ -2,7 +2,7 @@
 # e2e for story 1: setup -> compile -> run -> assert.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 WORK=/tmp/tc-stories/pr-review
 

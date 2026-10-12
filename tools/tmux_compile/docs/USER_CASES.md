@@ -2,6 +2,7 @@
 
 > 29 个真实场景，来自 GitHub issue/PR/README。每个标注可编译性。
 > 搜集日期：2026-10-12。宁缺毋滥：无强链接的不收。
+> **Trace 佐证**（2026-10-12 新增）：[freeinference_agentic_trace](https://huggingface.co/datasets/harvardMadsys/freeinference_agentic_trace)（Nixon et al. 2026, CC BY 4.0），2026-08-30~09-05 一周：2,047 sessions / 190,544 requests。标 ✅ 的 case 有真实 trace 数据支撑，详见 TRACE_VALIDATION.md。
 
 **判定标准**（对照编译器原语）：
 - **能**：run / wait_for / branch / parallel（一层）/ retry（有界）/ fail / params 可完整表达
@@ -228,3 +229,17 @@
 | deploy-healthcheck（新增） | D1（蓝绿+健康检查） |
 | retry-until-ready（新增） | D7（gh-ost 等待+重试） |
 | conditional-setup（新增） | T2（按探测条件分支） |
+| trace-iterative-test（trace 提取） | 迭代调试：663 sessions 有 3+ 连续 shell 调用 ✅ |
+| trace-retry-build（trace 提取） | 失败重试：802 sessions（39.2%）error→同工具重试 ✅ |
+| trace-branch-deploy（trace 提取） | 条件分支：healthcheck→deploy/abort ✅ |
+
+### Trace 佐证汇总（freeinference_agentic_trace，1 周）
+
+| 断言 | Trace 数据 | 状态 |
+|------|-----------|------|
+| 连续 shell 调用是高频模式 | 663 sessions（32.4%）有 3+ 连续 Interpreter 调用 | ✅ 佐证 |
+| 失败重试是高频模式 | 802 sessions（39.2%）error 后同工具重试 | ✅ 佐证 |
+| bash 是主导 shell 工具 | bash 13,357 calls，占 Interpreter 46% | ✅ 佐证 |
+| 真实 session 远长于 benchmark | p50=35 轮，64% 超 20 轮 | ✅ 佐证（P1 覆盖面修正） |
+| Prefix caching 是生产标配 | 97.1% requests 有 cache 命中 | ✅ 佐证（P2） |
+| 真实 TTFT 高于 sim-server 假设 | deepseek-v4-flash p50=807ms（假设 flash 200ms） | ⚠️ 假设偏乐观 |
