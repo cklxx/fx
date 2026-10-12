@@ -254,7 +254,7 @@ def _parse_step(node, declared, allow_parallel, allow_retry=True):
         if mods:
             badk = mods[next(iter(mods))][0]
             raise _err(badk, "branch does not accept timeout_s/assert_exit")
-        return _parse_branch(vnode, line, declared, allow_retry)
+        return _parse_branch(vnode, line, declared, allow_parallel, allow_retry)
     if kind == "parallel":
         if not allow_parallel:
             raise CompileError("parallel may not be nested inside parallel", line)
@@ -310,7 +310,7 @@ def _parse_wait(vnode, mods, line, declared):
     return {"kind": "wait_for", "pattern": pattern, "timeout_s": timeout, "line": line}
 
 
-def _parse_branch(vnode, line, declared, allow_retry=True):
+def _parse_branch(vnode, line, declared, allow_parallel, allow_retry=True):
     if not isinstance(vnode, yaml.MappingNode):
         raise _err(vnode, "branch must be a mapping")
     seen = {}
@@ -328,9 +328,9 @@ def _parse_branch(vnode, line, declared, allow_retry=True):
     pattern = _as_str(seen["if_output_contains"], "if_output_contains", declared)
     if not pattern:
         raise _err(seen["if_output_contains"], "if_output_contains must not be empty")
-    then_steps = _parse_steps(seen["then"], declared, True, allow_retry, allow_empty=True)
+    then_steps = _parse_steps(seen["then"], declared, allow_parallel, allow_retry, allow_empty=True)
     else_steps = (
-        _parse_steps(seen["else"], declared, True, allow_retry, allow_empty=True)
+        _parse_steps(seen["else"], declared, allow_parallel, allow_retry, allow_empty=True)
         if "else" in seen
         else []
     )
@@ -371,8 +371,13 @@ def _parse_parallel(vnode, mods, line, declared):
         name = None
         steps_node = None
         leg_timeout = None
+        seen_leg_keys = set()
         for k, v in ln.value:
             ks = k.value
+            if ks in ("name", "steps", "timeout_s"):
+                if ks in seen_leg_keys:
+                    raise _err(k, "duplicate leg key '%s'" % ks)
+                seen_leg_keys.add(ks)
             if ks == "name":
                 name = _as_str(v, "leg name", declared)
             elif ks == "steps":
@@ -553,6 +558,14 @@ def _subst_steps(steps, values):
                 )
         elif kind == "parallel":
             for leg in st["legs"]:
+                # leg names allow {{param}} (validated at parse time); substitute
+                # here like every other param-bearing field.
+                leg["name"] = _subst(leg["name"], values)
+                if not leg["name"].strip():
+                    raise CompileError(
+                        "leg name became empty after param substitution",
+                        leg["line"],
+                    )
                 _subst_steps(leg["steps"], values)
         elif kind == "retry":
             if st["until_output_contains"] is not None:
@@ -595,11 +608,17 @@ def compile_dsl(dsl_path, out_path, params=None):
     with open(dsl_path, "r") as f:
         text = f.read()
     try:
-        root = yaml.compose(text)
+        docs = [d for d in yaml.compose_all(text) if d is not None]
     except yaml.YAMLError as e:
         raise CompileError("YAML syntax error: %s" % e)
-    if root is None:
+    if not docs:
         raise CompileError("%s: empty document" % dsl_path)
+    if len(docs) > 1:
+        raise CompileError(
+            "%s: %d YAML documents found; only one is supported"
+            % (dsl_path, len(docs))
+        )
+    root = docs[0]
     if not isinstance(root, yaml.MappingNode):
         raise CompileError("top level must be a mapping", _line(root))
     name, steps, declared = _parse_top(root, dsl_path)
