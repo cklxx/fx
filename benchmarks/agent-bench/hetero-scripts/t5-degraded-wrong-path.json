@@ -1,0 +1,1 @@
+{"steps":[{"text":"Reading data","tool_calls":[{"arguments":{"path":"data.json"},"name":"read_file"}]},{"text":"Writing report to wrong path","tool_calls":[{"arguments":{"content":"# Report\n\nProject: agent-bench\nVersion: 3\n\nItems:\n- alpha\n- beta\n- gamma\n","path":"wrong_report.md"},"name":"write_file"}]},{"finish":"stop","text":"Done"}],"task":"T5-degraded"}
