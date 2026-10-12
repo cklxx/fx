@@ -11993,6 +11993,33 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        // P1: Skip the model confirmation round when all tools succeeded with
+        // no decision-relevant output. The model has no new information to act
+        // on, so the confirmation round is pure overhead (one TTFT).
+        if (config.skip_confirm_round and
+            step_batch.step_total_count > 0 and
+            step_batch.step_error_count == 0 and
+            !step_batch.step_had_decision_output)
+        {
+            debug_trace.eventf("agent", "skip_confirm_round", step_ctx, "tool_count={d}", .{step_batch.step_total_count});
+            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = null };
+            stop_state.terminal_materializing = true;
+            try finishCommonAssistantTerminal(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                assistant_text,
+                .completed,
+                null,
+                &finish_trace,
+                "tool",
+                null,
+            );
+            return;
+        }
         if (malformed_arguments_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(

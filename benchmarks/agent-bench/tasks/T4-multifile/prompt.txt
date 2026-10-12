@@ -1,0 +1,5 @@
+Create three files in the current directory:
+- util.py: defines greet(name) returning f"hi {name}"
+- logic.py: imports greet from util, defines run() returning greet("bench")
+- main.py: imports run from logic, prints run()
+Running "python3 main.py" must print "hi bench".

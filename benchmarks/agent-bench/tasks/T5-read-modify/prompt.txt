@@ -1,0 +1,1 @@
+Read data.json in the current directory. Generate report.md containing: a "# Report" heading, the project name, the version number, and a bullet list of all items. Then verify report.md exists.

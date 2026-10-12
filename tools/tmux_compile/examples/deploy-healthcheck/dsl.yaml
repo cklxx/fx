@@ -1,0 +1,40 @@
+# D1 (capistrano-bluey): blue-green deploy + health check + conditional switch.
+# Deploy to idle color, wait for health, flip traffic only if healthy.
+# Failure path: broken deploy never becomes healthy -> retry exhausts -> fail,
+# old color keeps serving (no rollback needed: it was never stopped).
+name: deploy-healthcheck
+params:
+  work: {required: true}
+  color: {required: true}        # idle color to deploy
+  mode: {default: "ok"}          # ok | broken
+steps:
+  - run: |
+      cd {{work}}
+      ./deploy.sh {{color}} {{mode}} > /tmp/dh-deploy.log 2>&1 &
+      echo DEPLOY_STARTED
+    timeout_s: 30
+  # wait for the new color to become healthy (bounded)
+  - retry:
+      attempts: 8
+      delay_s: 1
+      until_output_contains: "HEALTHY {{color}}"
+      steps:
+        - run: |
+            cd {{work}}
+            ./health.sh {{color}}
+          timeout_s: 30
+  # healthy -> flip traffic; the branch decides by re-checking the flag file
+  - run: |
+      cd {{work}}
+      if [ -f "{{color}}.healthy" ]; then echo TRAFFIC_SWITCH; else echo STILL_DOWN; fi
+    timeout_s: 30
+  - branch:
+      if_output_contains: TRAFFIC_SWITCH
+      then:
+        - run: |
+            cd {{work}}
+            echo "{{color}}" > current.txt
+            echo "SWITCHED to {{color}}"
+          timeout_s: 30
+      else:
+        - fail: new-color-unhealthy

@@ -1,0 +1,37 @@
+# D7 (gh-ost): online migration with lag gate + bounded retry + panic flag.
+# Start migration, wait until replication lag drains (bounded attempts),
+# abort immediately if the operator drops the panic flag.
+name: retry-until-ready
+params:
+  work: {required: true}
+steps:
+  - run: |
+      cd {{work}}
+      ./migrate.sh
+    timeout_s: 30
+  # drain the lag: bounded retry, each attempt re-checks
+  - retry:
+      attempts: 8
+      delay_s: 1
+      until_output_contains: "LAG_OK"
+      steps:
+        - run: |
+            cd {{work}}
+            ./lag.sh
+          timeout_s: 30
+  # panic flag = operator kill-switch -> abort even if lag drained.
+  # NOTE: marker must not be a substring of the negative case (NO_PANIC
+  # contains PANIC), so use distinct tokens.
+  - run: |
+      cd {{work}}
+      if [ -f panic.flag ]; then echo ABORT_PANIC; else echo CONTINUE_OK; fi
+    timeout_s: 30
+  - branch:
+      if_output_contains: ABORT_PANIC
+      then:
+        - fail: operator-panic
+      else:
+        - run: |
+            cd {{work}}
+            echo "CUTOVER_DONE rows_verified=1000" | tee cutover.log
+          timeout_s: 30

@@ -26,6 +26,9 @@ pub const StepBatchState = struct {
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
+    /// True if any tool returned non-empty output that the model might need
+    /// for its next decision (read content, shell stdout, etc.).
+    step_had_decision_output: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
@@ -72,6 +75,11 @@ pub fn appendToolResultContent(
     if (accounting.increment_total) batch.step_total_count += 1;
     if (accounting.increment_error) batch.step_error_count += 1;
     if (accounting.mark_write) batch.step_had_writes = true;
+    // Track decision-relevant output: non-empty tool output that the model
+    // might need for its next decision. Used by skip_confirm_round.
+    if (std.mem.trim(u8, model_output, " \t\r\n").len > 0) {
+        batch.step_had_decision_output = true;
+    }
     var content = model_output;
     // Only well-formed calls escalate: malformed-argument rejections never
     // execute and already have their own hard-stop path.

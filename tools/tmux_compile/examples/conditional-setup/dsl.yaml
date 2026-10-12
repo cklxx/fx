@@ -1,0 +1,49 @@
+# T2 (tmuxinator#658): only attach monitors for services actually running.
+# Each service gets its own probe+branch pair: branch matchers see only the
+# fresh output after the nearest run, so probes cannot be shared.
+name: conditional-setup
+params:
+  work: {required: true}
+steps:
+  - run: |
+      cd {{work}}
+      if grep -q "pipeline-server" services.txt; then echo FOUND; else echo MISSING; fi
+    timeout_s: 30
+  - branch:
+      if_output_contains: FOUND
+      then:
+        - run: |
+            cd {{work}}
+            ./monitor.sh pipeline-server
+          timeout_s: 30
+      else:
+        - run: echo "SKIP pipeline-server (not running)"
+          timeout_s: 30
+  - run: |
+      cd {{work}}
+      if grep -q "redis-cache" services.txt; then echo FOUND; else echo MISSING; fi
+    timeout_s: 30
+  - branch:
+      if_output_contains: FOUND
+      then:
+        - run: |
+            cd {{work}}
+            ./monitor.sh redis-cache
+          timeout_s: 30
+      else:
+        - run: echo "SKIP redis-cache (not running)"
+          timeout_s: 30
+  - run: |
+      cd {{work}}
+      if grep -q "search-api" services.txt; then echo FOUND; else echo MISSING; fi
+    timeout_s: 30
+  - branch:
+      if_output_contains: FOUND
+      then:
+        - run: |
+            cd {{work}}
+            ./monitor.sh search-api
+          timeout_s: 30
+      else:
+        - run: echo "SKIP search-api (not running)"
+          timeout_s: 30

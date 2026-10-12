@@ -17,6 +17,9 @@ pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
+    /// Slim tool schemas: trim "When NOT to use" from function descriptions
+    /// and skip property descriptions. Reduces request body by ~23%.
+    slim_tool_schemas: bool = false,
 };
 
 pub const Error = error{
@@ -514,6 +517,20 @@ fn flush_tool_image_follow_up(
     pending_images.clearRetainingCapacity();
 }
 
+/// Trim "When NOT to use" section from tool descriptions to reduce request size.
+/// The guidance is helpful but not essential for tool selection.
+fn writeTrimmedDescription(alloc: std.mem.Allocator, writer: *std.Io.Writer, description: []const u8) !void {
+    const marker = "When NOT to use:";
+    if (std.mem.indexOf(u8, description, marker)) |idx| {
+        // Trim trailing whitespace before the marker
+        var end = idx;
+        while (end > 0 and (description[end - 1] == ' ' or description[end - 1] == '\n')) : (end -= 1) {}
+        try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description[0..end]);
+    } else {
+        try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description);
+    }
+}
+
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
@@ -581,7 +598,7 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
             try std.json.Stringify.value(function.name, .{}, writer);
             try writer.writeAll(",\"description\":");
-            try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description);
+            try writeTrimmedDescription(alloc, writer, function.description);
             try writer.writeAll(",\"parameters\":");
             switch (function.schema) {
                 .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),

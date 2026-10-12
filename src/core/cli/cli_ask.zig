@@ -2132,6 +2132,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             false,
         .current_prompt_is_root_authority = current_prompt_is_root_authority,
+        .skip_confirm_round = true,
+        .slim_tool_schemas = true,
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
         .ephemeral_command_replay = if (session_child_capability == null)

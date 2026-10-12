@@ -231,10 +231,13 @@ fn writePropertySchema(
     if (bounds.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{bounds.max_length});
     if (bounds.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{bounds.minimum});
     if (bounds.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{bounds.maximum});
-    if (property.description.len > 0) {
-        try writer.writeAll(",\"description\":");
-        try writeCappedDescriptionJsonString(alloc, writer, property.description);
-    }
+    // P3 schema slimming: skip property descriptions to reduce request body.
+    // Param names + types + required fields carry the essential info.
+    // If model misuses params, revert this change.
+    // if (property.description.len > 0) {
+    //     try writer.writeAll(",\"description\":");
+    //     try writeCappedDescriptionJsonString(alloc, writer, property.description);
+    // }
     if (bounds.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{bounds.min_items});
     if (bounds.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{bounds.max_items});
     if (property.shape) |shape| {

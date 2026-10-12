@@ -1,0 +1,1 @@
+Create a file named hello.py in the current directory. The file must print exactly "hello agent-bench" when run with python3. Do nothing else.

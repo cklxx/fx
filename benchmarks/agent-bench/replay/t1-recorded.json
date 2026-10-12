@@ -1,0 +1,35 @@
+{
+  "task": "T1",
+  "profile": "pro",
+  "fx_version": "v0.0.13",
+  "recorded_at": "2026-10-10T17:08:53.728Z",
+  "steps": [
+    {
+      "name": "write_file",
+      "status": "success"
+    }
+  ],
+  "llm_rounds": 2,
+  "assert": "passed",
+  "script": {
+    "steps": [
+      {
+        "text": "Creating hello.py",
+        "tool_calls": [
+          {
+            "arguments": {
+              "content": "print(\"hello agent-bench\")\n",
+              "path": "hello.py"
+            },
+            "name": "write_file"
+          }
+        ]
+      },
+      {
+        "finish": "stop",
+        "text": "Done"
+      }
+    ],
+    "task": "T1"
+  }
+}

@@ -1,0 +1,79 @@
+# Story 2: 三路并行开发再合并
+# implement.sh is a deterministic stand-in for `agent implement`; worktrees,
+# parallel panes, sequential merge and honest conflict stop are all real.
+name: parallel-dev
+params:
+  feature: {required: true}
+  repo: {required: true}
+  helpers: {required: true}
+  base: {default: "main"}
+  conflict: {default: "0"}
+steps:
+  # phase 1: one worktree + branch per module (sequential: git locks)
+  - run: |
+      cd {{repo}}
+      for m in fe be it; do
+        git worktree remove --force /tmp/dev-$m 2>/dev/null || true
+        git branch -D {{feature}}-$m 2>/dev/null || true
+      done
+      git branch -D {{feature}} 2>/dev/null || true
+      git worktree add -b {{feature}}-fe /tmp/dev-fe {{base}}
+      git worktree add -b {{feature}}-be /tmp/dev-be {{base}}
+      git worktree add -b {{feature}}-it /tmp/dev-it {{base}}
+      echo "WORKTREES_READY"
+    timeout_s: 120
+    assert_exit: 0
+  # phase 2: three modules in parallel, one pane each
+  - parallel:
+      legs:
+        - name: frontend
+          timeout_s: 600
+          steps:
+            - run: |
+                {{helpers}}/implement.sh fe /tmp/dev-fe {{conflict}}
+              timeout_s: 600
+              assert_exit: 0
+        - name: backend
+          timeout_s: 600
+          steps:
+            - run: |
+                {{helpers}}/implement.sh be /tmp/dev-be {{conflict}}
+              timeout_s: 600
+              assert_exit: 0
+        - name: itests
+          timeout_s: 600
+          steps:
+            - run: |
+                {{helpers}}/implement.sh it /tmp/dev-it {{conflict}}
+              timeout_s: 600
+              assert_exit: 0
+    timeout_s: 900
+  # phase 3: sequential merge. Plain markers: command echo is suppressed,
+  # so `echo MERGE_CONFLICT` can't false-match. No manual `clear` needed.
+  - run: |
+      cd {{repo}}
+      git checkout -q -B {{feature}} {{base}}
+      : > /tmp/conflicts.txt
+      for m in fe be it; do
+        git merge --no-ff "{{feature}}-$m" -m "merge $m" >/tmp/merge-$m.log 2>&1 || { echo "$m" >> /tmp/conflicts.txt; break; }
+      done
+      if [ -s /tmp/conflicts.txt ]; then echo MERGE_CONFLICT; else echo MERGE_CLEAN; fi
+    timeout_s: 120
+  - branch:
+      if_output_contains: "MERGE_CONFLICT"
+      then:
+        - run: |
+            cd {{repo}}
+            cat /tmp/conflicts.txt
+            git status --short | head -20
+            git merge --abort
+            echo "STOPPED_FOR_HUMAN"
+          timeout_s: 30
+        - fail: merge-conflict-needs-human
+      else:
+        - run: |
+            cd {{repo}}
+            git checkout -q {{feature}}
+            ./run-tests.sh
+          timeout_s: 300
+          assert_exit: 0
