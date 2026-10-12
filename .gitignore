@@ -55,3 +55,8 @@ benchmarks/baseline.json
 .vibe/
 .windsurf/
 .zencoder/
+
+# Python (tools/)
+__pycache__/
+*.pyc
+*.pyo
