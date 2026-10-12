@@ -51,6 +51,9 @@ LLM_estimate = product_time + N_rounds × (TTFT + streaming_per_round)
 
 ## 2. 数据表
 
+> 注：以下 flash 行的 TTFT 取自 sim-server（§1.2），真实模型 TTFT 更大。
+> 真实 TTFT 下的重算见 §5。
+
 ### bug-hunt（7 steps：复现 → bisect → 读 culprit → 逆向修复 → 验证）
 
 | 项 | 时间 |
@@ -124,8 +127,40 @@ LLM_estimate = product_time + N_rounds × (TTFT + streaming_per_round)
 
 | 模型速度 | 加速比 | 含义 |
 |---------|--------|------|
-| flash（快模型） | ~1.7-1.8× | 省一半时间，值得 |
-| pro（中等） | ~3.7-4.5× | 省 3/4 时间，明显 |
-| slow（慢模型/高 TTFT） | ~8-10× | 省 90% 时间，质变 |
+| flash 级（真实 TTFT 504–807ms，见 §5） | ~2.6-4.1× | 省 60–75% 时间 |
+| pro（sim 800ms；恰好接近真实 deepseek 级 TTFT） | ~3.7-4.5× | 省 3/4 时间，明显 |
+| slow（sim 2000ms；真实数据待定） | ~8-10× | 省 90% 时间，质变 |
 
 编译把"每步等 LLM"变成"一次编译、直接执行"。模型越慢，省得越多。
+
+## 5. 真实 trace 修正（2026-10-12 联合验证）
+
+§2 的 flash 行基于 sim-server 的 TTFT ~200ms。2026-10-12 用
+harvardMadsys/freeinference_agentic_trace（约 120 万 tool 调用）做联合验证，
+得到真实模型 TTFT，替换后重算如下。公式与 §1.2 相同，仅换 TTFT；
+streaming 仍沿用 sim 实测 28ms/轮（未单独测量，量级远小于 TTFT）。
+
+| 真实模型 | TTFT/轮 | 每轮合计（TTFT+streaming） |
+|---------|--------|--------------------------|
+| qwen3.6-35b（最接近 flash 的真实模型） | 504ms | 532ms |
+| deepseek-v4-flash | 807ms | 835ms |
+
+| story | 轮数 | 编译合计 | qwen LLM 合计 | 加速比 | deepseek LLM 合计 | 加速比 |
+|-------|-----|---------|--------------|-------|-----------------|-------|
+| bug-hunt | 6 | 1902ms | 1775 + 6×532 = 4967ms | **2.6×** | 1775 + 6×835 = 6785ms | **3.6×** |
+| pr-review | 5 | 1457ms | 1284 + 5×532 = 3944ms | **2.7×** | 1284 + 5×835 = 5459ms | **3.7×** |
+| parallel-dev | 7 | 1872ms | 1785 + 7×532 = 5509ms | **2.9×** | 1785 + 7×835 = 7630ms | **4.1×** |
+
+结论：
+
+1. 真实 flash 级模型加速比 **2.6–4.1×**，高于 §4 原 flash 行（1.7–1.8×）。
+   原 pro 行（3.7–4.5×）恰好接近真实 deepseek 级的表现。
+2. 模型档位标签不可信：glm-5.3-flash 比 deepseek 慢 7 倍，"flash" 是营销词。
+   分档按实测 TTFT，不按厂商标签。
+3. session 级放大：真实 session 轮数 p50 = 35（≤2 轮仅 1.6%，远超 story 假设的 5–7 轮）。
+   qwen 级每 session 省 35×504 ≈ 17.6s TTFT，deepseek 级约 28.2s。
+   限制：只有可编译轮产生节约——trace 中 32.4% session 有 3+ 连续 shell 调用；
+   39.2% session 有失败重试，轮数更多，节约更大。
+4. §1.2 的反向修正仍然有效：P3 把 prompt 从 27KB 瘦到 19KB，
+   sim 侧 prefill 被高估，加速比被高估。两项修正方向相反，
+   净效应需要 P3 后重测 sim-server 才能定量。
