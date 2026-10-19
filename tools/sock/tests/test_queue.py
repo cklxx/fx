@@ -17,7 +17,9 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.q = Queue(QueueDeclare(name="t", semantics="workqueue"),
                        self.tmp)
-        self.q.consume("c1", "g", ack_wait_s=30, max_deliver=3)
+        # 这些用例测重入语义，不测退避（退避见 test_durability.py）。
+        self.q.consume("c1", "g", ack_wait_s=30, max_deliver=3,
+                       backoff_base_s=0)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -166,7 +168,9 @@ class TestUnconsume(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.q = Queue(QueueDeclare(name="t", semantics="workqueue"), self.tmp)
-        self.q.consume("c1", "g", ack_wait_s=30, max_deliver=3)
+        # 这些用例测重入语义，不测退避（退避见 test_durability.py）。
+        self.q.consume("c1", "g", ack_wait_s=30, max_deliver=3,
+                       backoff_base_s=0)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)

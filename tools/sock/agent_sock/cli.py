@@ -60,35 +60,34 @@ def cmd_depth(args):
         print(json.dumps({"queue": args.queue, "depth": 0,
                           "error": "not found"}))
         return
-    q = Queue(QueueDeclare(name=args.queue, semantics="workqueue"), qdir)
+    q = Queue(QueueDeclare(name=args.queue, semantics="workqueue"), qdir,
+              read_only=True)
     print(json.dumps({"queue": args.queue, "depth": q.depth()}))
 
 
 def cmd_dlq(args):
+    """列出死信。只读打开日志，server 运行中也可用。"""
     data_dir = args.data_dir or os.path.expanduser("~/.agent-sock")
     from .queue import Queue, QueueDeclare
     qdir = os.path.join(data_dir, "queues", args.queue)
-    q = Queue(QueueDeclare(name=args.queue, semantics="workqueue"), qdir)
-    # server 方法复用：直接调 Queue
-    dead = [{"mid": m.mid, "message_id": m.message_id,
-             "pend_count": m.pend_count}
-            for m in q.messages.values() if m.state == "dead"]
-    print(json.dumps({"queue": args.queue, "dead": dead}, indent=2))
+    if not os.path.isdir(qdir):
+        print(json.dumps({"queue": args.queue, "dead": [],
+                          "error": "not found"}))
+        return
+    q = Queue(QueueDeclare(name=args.queue, semantics="workqueue"), qdir,
+              read_only=True)
+    print(json.dumps({"queue": args.queue, "dead": q.dead_letters()},
+                     indent=2))
 
 
 def cmd_replay_dlq(args):
+    """死信重放（离线）：先停 server，再运行；重启后生效。"""
     data_dir = args.data_dir or os.path.expanduser("~/.agent-sock")
     from .queue import Queue, QueueDeclare
     qdir = os.path.join(data_dir, "queues", args.queue)
     q = Queue(QueueDeclare(name=args.queue, semantics="workqueue"), qdir)
-    n = 0
-    for m in q.messages.values():
-        if m.state == "dead":
-            m.state = "queued"
-            m.pend_count = 0
-            m.pend_consumer = ""
-            n += 1
-    q.snapshot()
+    n = q.replay_dead()
+    q.log.close()
     print(json.dumps({"queue": args.queue, "replayed": n}))
 
 

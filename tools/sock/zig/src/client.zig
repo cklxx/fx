@@ -137,6 +137,28 @@ pub const Client = struct {
         return seq;
     }
 
+    /// consume with a backoff base (seconds, decimal text such as "0.5").
+    pub fn consumeBackoff(
+        self: *Client,
+        queue: []const u8,
+        group: []const u8,
+        ack_wait_s: u32,
+        max_deliver: u32,
+        backoff_base_s: []const u8,
+    ) !u64 {
+        var w = proto.XmlWriter.init(self.alloc);
+        defer w.deinit();
+        const seq = try self.beginSend(&w, .queue_consume, null);
+        try w.element("queue", queue);
+        try w.element("group", group);
+        var num_buf: [64]u8 = undefined;
+        try w.element("ack_wait_s", try std.fmt.bufPrint(&num_buf, "{d}", .{ack_wait_s}));
+        try w.element("max_deliver", try std.fmt.bufPrint(&num_buf, "{d}", .{max_deliver}));
+        try w.element("backoff_base_s", backoff_base_s);
+        try self.finishSend(&w);
+        return seq;
+    }
+
     pub fn ack(
         self: *Client,
         queue: []const u8,
@@ -144,13 +166,31 @@ pub const Client = struct {
         delivery_id: []const u8,
         requeue: bool,
     ) !u64 {
+        return self.ackMode(queue, group, delivery_id, if (requeue) .requeue else .ack);
+    }
+
+    pub const AckMode = enum { ack, requeue, reject };
+
+    /// reject: the message goes to the dead letters, no redelivery.
+    /// The server replies (in_reply_to = returned seq) after the ack is on disk.
+    pub fn ackMode(
+        self: *Client,
+        queue: []const u8,
+        group: []const u8,
+        delivery_id: []const u8,
+        mode: AckMode,
+    ) !u64 {
         var w = proto.XmlWriter.init(self.alloc);
         defer w.deinit();
         const seq = try self.beginSend(&w, .queue_ack, null);
         try w.element("queue", queue);
         try w.element("group", group);
         try w.element("delivery_id", delivery_id);
-        if (requeue) try w.raw("<requeue/>");
+        switch (mode) {
+            .ack => {},
+            .requeue => try w.raw("<requeue/>"),
+            .reject => try w.raw("<reject/>"),
+        }
         try self.finishSend(&w);
         return seq;
     }

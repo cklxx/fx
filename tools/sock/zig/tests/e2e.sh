@@ -280,16 +280,17 @@ with open('$TDIR/doctype.bin','wb') as f:
 }
 
 # ---------- T16: max_deliver -> dead, no infinite requeue ----------
+# --bb 0: this case tests max_deliver, not backoff (see T21).
 t16() {
   t_begin; t_server || { fail T16 "server start"; t_end; return; }
   tk pub task.dispatch task-P p >/dev/null
-  l1=$(tk consume1 task.dispatch workers 3000 30 2); d1=$(echo "$l1" | awk '/^DLV/{print $2}')
+  l1=$(tk consume1 task.dispatch workers 3000 30 2 --bb 0); d1=$(echo "$l1" | awk '/^DLV/{print $2}')
   r1=$(echo "$l1" | awk '/^DLV/{print $4}')
   tk ack task.dispatch workers "$d1" --requeue >/dev/null
-  l2=$(tk consume1 task.dispatch workers 3000 30 2); d2=$(echo "$l2" | awk '/^DLV/{print $2}')
+  l2=$(tk consume1 task.dispatch workers 3000 30 2 --bb 0); d2=$(echo "$l2" | awk '/^DLV/{print $2}')
   r2=$(echo "$l2" | awk '/^DLV/{print $4}')
   tk ack task.dispatch workers "$d2" --requeue >/dev/null
-  l3=$(tk consume1 task.dispatch workers 2000 30 2)
+  l3=$(tk consume1 task.dispatch workers 2000 30 2 --bb 0)
   if [ "$r1" = "redelivered=false" ] && [ "$r2" = "redelivered=true" ] && echo "$l3" | grep -q NONE; then
     pass T16
   else
@@ -336,17 +337,130 @@ t18() {
   t_end
 }
 
+dlv_of() { echo "$1" | awk '/^DLV/{print $2}'; }
+mid_of() { echo "$1" | awk '/^DLV/{print $3}'; }
+
+# ---------- T19: kill -9 after acks -> acked stay acked, unacked survive ----------
+t19() {
+  t_begin; t_server || { fail T19 "server start"; t_end; return; }
+  for i in 1 2 3 4 5; do tk pub task.dispatch "task-$i" "p$i" | grep -q "PUB mid=" || { fail T19 "pub $i"; t_end; return; }; done
+  for i in 1 2; do
+    l=$(tk consume1 task.dispatch workers 3000 30 5)
+    r=$(tk ack task.dispatch workers "$(dlv_of "$l")")
+    [ "$r" = "ACKED result=acked" ] || { fail T19 "ack $i: $r"; t_end; return; }
+  done
+  lf=$(tk consume1 task.dispatch workers 3000 30 5)   # in flight at crash
+  t_kill_server
+  t_server || { fail T19 "restart"; t_end; return; }
+  got=""
+  for i in 1 2 3 4; do
+    l=$(tk consume1 task.dispatch workers 1500 30 5 --id "r$i")
+    m=$(mid_of "$l"); [ -z "$m" ] && break
+    got="$got $m"
+    tk ack task.dispatch workers "$(dlv_of "$l")" >/dev/null
+  done
+  want=" task-3 task-4 task-5"
+  if [ "$(mid_of "$lf")" = task-3 ] && [ "$got" = "$want" ]; then pass T19; else fail T19 "got=[$got] want=[$want] inflight=$(mid_of "$lf")"; fi
+  t_end
+}
+
+# ---------- T20: reject -> dead letter, no redelivery, survives restart, listed ----------
+t20() {
+  t_begin; t_server || { fail T20 "server start"; t_end; return; }
+  tk pub task.dispatch task-R poison >/dev/null
+  l=$(tk consume1 task.dispatch workers 3000 30 5)
+  r=$(tk ack task.dispatch workers "$(dlv_of "$l")" --reject)
+  l2=$(tk consume1 task.dispatch workers 1500 30 5)
+  t_kill_server
+  t_server || { fail T20 "restart"; t_end; return; }
+  l3=$(tk consume1 task.dispatch workers 1500 30 5)
+  dlq=$( cd "$TDIR" && "$SERVER" --dlq task.dispatch 2>/dev/null )
+  if [ "$r" = "ACKED result=dead" ] && echo "$l2" | grep -q NONE && echo "$l3" | grep -q NONE \
+     && echo "$dlq" | grep -q '"message_id":"task-R","reason":"rejected","deliver_count":1'; then
+    pass T20
+  else
+    fail T20 "r=$r l2=$l2 l3=$l3 dlq=$dlq"
+  fi
+  t_end
+}
+
+# ---------- T21: requeue -> exponential backoff delays redelivery ----------
+t21() {
+  t_begin; t_server || { fail T21 "server start"; t_end; return; }
+  tk pub task.dispatch task-B b >/dev/null
+  l1=$(tk consume1 task.dispatch workers 3000 30 5 --bb 1)
+  r1=$(tk ack task.dispatch workers "$(dlv_of "$l1")" --requeue)
+  l2=$(tk consume1 task.dispatch workers 300 30 5 --bb 1)    # attempt 1: delay in [0.5s, 1s)
+  sleep 1.1
+  l3=$(tk consume1 task.dispatch workers 3000 30 5 --bb 1)
+  if [ "$r1" = "ACKED result=queued" ] && echo "$l2" | grep -q NONE \
+     && [ "$(mid_of "$l3")" = task-B ] && echo "$l3" | grep -q "redelivered=true"; then
+    pass T21
+  else
+    fail T21 "r1=$r1 l2=$l2 l3=$l3"
+  fi
+  t_end
+}
+
+# ---------- T22: torn WAL tail after crash -> truncated, later records kept ----------
+t22() {
+  t_begin; t_server || { fail T22 "server start"; t_end; return; }
+  tk pub task.dispatch task-1 a >/dev/null
+  tk pub task.dispatch task-2 b >/dev/null
+  t_kill_server
+  printf '{"op":"pub","queue":"task.dispatch","mid":3,"id":"tor' >> "$TDIR/.agent-sock/data/wal.jsonl"
+  t_server || { fail T22 "restart 1"; t_end; return; }
+  tk pub task.dispatch task-3 c >/dev/null
+  t_kill_server
+  t_server || { fail T22 "restart 2"; t_end; return; }
+  got=""
+  for i in 1 2 3 4; do
+    l=$(tk consume1 task.dispatch workers 1500 30 5 --id "c$i")
+    m=$(mid_of "$l"); [ -z "$m" ] && break
+    got="$got $m"
+    tk ack task.dispatch workers "$(dlv_of "$l")" >/dev/null
+  done
+  if [ "$got" = " task-1 task-2 task-3" ]; then
+    pass T22
+  else
+    fail T22 "got=[$got]"
+  fi
+  t_end
+}
+
+# ---------- T23: requeue of one message does not redeliver acked/in-flight ones ----------
+t23() {
+  t_begin; t_server || { fail T23 "server start"; t_end; return; }
+  tk pub task.dispatch task-A a >/dev/null
+  tk pub task.dispatch task-B b >/dev/null
+  tk pub task.dispatch task-C c >/dev/null
+  la=$(tk consume1 task.dispatch workers 3000 30 5 --bb 0)
+  lb=$(tk consume1 task.dispatch workers 3000 30 5 --bb 0)
+  lc=$(tk consume1 task.dispatch workers 3000 30 5 --bb 0)     # C stays in flight
+  tk ack task.dispatch workers "$(dlv_of "$lb")" >/dev/null
+  tk ack task.dispatch workers "$(dlv_of "$la")" --requeue >/dev/null
+  l1=$(tk consume1 task.dispatch workers 3000 30 5 --bb 0)
+  l2=$(tk consume1 task.dispatch workers 1500 30 5 --bb 0)
+  if [ "$(mid_of "$l1")" = task-A ] && echo "$l2" | grep -q NONE && [ "$(mid_of "$lc")" = task-C ]; then
+    pass T23
+  else
+    fail T23 "l1=$l1 l2=$l2"
+  fi
+  t_end
+}
+
 run_case() {
   case "$1" in
     t01) t01;; t02) t02;; t03) t03;; t04) t04;; t05) t05;; t06) t06;;
     t07) t07;; t08) t08;; t09) t09;; t10) t10;; t11) t11;; t12) t12;;
     t13) t13;; t14) t14;; t15) t15;; t16) t16;; t17) t17;; t18) t18;;
+    t19) t19;; t20) t20;; t21) t21;; t22) t22;; t23) t23;;
     *) echo "unknown case $1"; exit 2;;
   esac
 }
 
 if [ $# = 0 ]; then
-  for c in t01 t02 t03 t04 t05 t06 t07 t08 t09 t10 t11 t12 t13 t14 t15 t16 t17 t18; do run_case "$c"; done
+  for c in t01 t02 t03 t04 t05 t06 t07 t08 t09 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23; do run_case "$c"; done
 else
   for c in "$@"; do run_case "$c"; done
 fi

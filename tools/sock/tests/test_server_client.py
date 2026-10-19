@@ -42,13 +42,15 @@ class TestServerClient(unittest.IsolatedAsyncioTestCase):
         sub = await self._client("sub")
         await pub.declare("tq", "workqueue")
         await sub.consume("tq", group="g")
-        mid = await pub.publish("tq", "m1", "<task>hello</task>")
-        self.assertGreater(mid, 0)
-        # 等投递
+        # 先注册 handler 再 publish：投递可能在 publish 应答之前到达，
+        # 没有 handler 时客户端丢弃它（以前这里有竞态）。
         got = []
         async def h(msg):
             got.append(msg)
         sub.on_deliver(h)
+        mid = await pub.publish("tq", "m1", "<task>hello</task>")
+        self.assertGreater(mid, 0)
+        # 等投递
         await asyncio.sleep(0.5)
         self.assertEqual(len(got), 1)
         d = got[0]

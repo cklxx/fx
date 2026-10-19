@@ -11,9 +11,10 @@ fn usage() void {
         \\usage: testkit <cmd> [args]
         \\  pub <queue> <message_id> <payload>        publish; prints PUB mid=N|DUP|CANCELLED | ERR <code>
         \\  pubfile <queue> <message_id> <file>
-        \\  consume1 <queue> <group> [timeout_ms] [aw_s] [md] [--id NAME]
+        \\  consume1 <queue> <group> [timeout_ms] [aw_s] [md] [--id NAME] [--bb SECONDS]
         \\                                          consume once; prints DLV <dlv> <mid> <b64payload> | NONE
-        \\  ack <queue> <group> <delivery_id> [--requeue]
+        \\  ack <queue> <group> <delivery_id> [--requeue|--reject]
+        \\                                          waits for the reply; prints ACKED result=<r> | ERR <code>
         \\  cancel <task_id>                         publish control-cancel to task.dispatch
         \\  declare <queue> <semantics> <max_depth> <overflow>
         \\  reg <name>                               register; prints REG OK
@@ -126,11 +127,15 @@ pub fn main(init: std.process.Init) !void {
         var aw: u32 = 30;
         var md: u32 = 5;
         var cid: []const u8 = "testkit";
+        var bb: ?[]const u8 = null; // backoff base seconds
         var pos: usize = 0; // positional index for timeout/aw/md
         var i: usize = 4;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--id") and i + 1 < args.len) {
                 cid = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--bb") and i + 1 < args.len) {
+                bb = args[i + 1];
                 i += 1;
             } else if (pos == 0) {
                 timeout = try std.fmt.parseInt(u32, args[i], 10);
@@ -145,7 +150,11 @@ pub fn main(init: std.process.Init) !void {
         }
         var c = try client_mod.Client.connect(alloc, io, sp, cid);
         defer c.deinit();
-        _ = try c.consume(args[2], args[3], aw, md);
+        if (bb) |b| {
+            _ = try c.consumeBackoff(args[2], args[3], aw, md, b);
+        } else {
+            _ = try c.consume(args[2], args[3], aw, md);
+        }
         while (true) {
             const m_opt = try c.recvDeadline(proto.nowMs() + @as(i64, @intCast(timeout)));
             if (m_opt == null) {
@@ -185,11 +194,21 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (std.mem.eql(u8, cmd, "ack")) {
         if (args.len < 5) return error.BadArgs;
-        const requeue = args.len > 5 and std.mem.eql(u8, args[5], "--requeue");
+        var mode: client_mod.Client.AckMode = .ack;
+        if (args.len > 5 and std.mem.eql(u8, args[5], "--requeue")) mode = .requeue;
+        if (args.len > 5 and std.mem.eql(u8, args[5], "--reject")) mode = .reject;
         var c = try client_mod.Client.connect(alloc, io, sp, "testkit");
         defer c.deinit();
-        _ = try c.ack(args[2], args[3], args[4], requeue);
-        out.print("ACKED\n", .{});
+        const seq = try c.ackMode(args[2], args[3], args[4], mode);
+        var t = try c.recvTimeout(seq, 5000);
+        defer t.deinit();
+        if (t.envelope.primitive == .err) {
+            printErr(&out, &t);
+            std.process.exit(3);
+        }
+        const r = if (t.root.child("result")) |re| try re.textContent(alloc) else try alloc.dupe(u8, "?");
+        defer alloc.free(r);
+        out.print("ACKED result={s}\n", .{std.mem.trim(u8, r, " \t\r\n")});
     } else if (std.mem.eql(u8, cmd, "cancel")) {
         if (args.len < 3) return error.BadArgs;
         var c = try client_mod.Client.connect(alloc, io, sp, "testkit");
@@ -346,7 +365,9 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 }
             }
-            _ = try c.ack(queue, group, dlv_t, false);
+            const aseq = try c.ack(queue, group, dlv_t, false);
+            var areply = try c.recvTimeout(aseq, 5000); // ack is on disk
+            areply.deinit();
             var dbuf: [1024]u8 = undefined;
             const dp = try std.fmt.bufPrint(&dbuf, "{s}/{s}.done", .{ outdir, mid_t });
             const df = try std.Io.Dir.createFile(std.Io.Dir.cwd(), io, dp, .{});
