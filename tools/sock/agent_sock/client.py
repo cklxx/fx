@@ -71,8 +71,10 @@ class Client:
             if t:
                 t.cancel()
         if self.writer:
+            # server 对 deregister 不回复（它直接关连接）。用 _fire，不等应答。
+            # 以前用 _request：reader 已取消，每次 close 都等满 10 秒超时。
             try:
-                await self._request(DEREGISTER, {"reason": "shutdown"})
+                await self._fire(DEREGISTER, {"reason": "shutdown"})
             except Exception:
                 pass
             self.writer.close()

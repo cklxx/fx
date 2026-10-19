@@ -87,9 +87,22 @@ class Server:
         server = await asyncio.start_unix_server(self._on_conn, self.sock_path)
         os.chmod(self.sock_path, 0o600)
         self._running = True
-        asyncio.get_running_loop().call_later(1.0, self._tick)
-        async with server:
-            await server.serve_forever()
+        loop = asyncio.get_running_loop()
+        loop.call_later(1.0, self._tick)
+        try:
+            # 不用 serve_forever()：Python 3.12+ 里它被取消时先 wait_closed()，
+            # 等全部连接结束，而连接还开着，于是一直等
+            # （test_server_client.py 卡住的原因之一）。这里先关连接再等。
+            await loop.create_future()
+        finally:
+            self._running = False
+            server.close()
+            for w in list(self.conns):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+            await server.wait_closed()
 
     # ---- 连接处理
 
