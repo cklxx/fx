@@ -37,6 +37,22 @@ PRIMITIVES = frozenset({
     Q_DELIVER, Q_ACK, ERROR,
 })
 
+# §11 任务层扩展原语（8 个）。只有 Python server 实现；Zig server 回 AEVT-4110。
+T_CREATE = "task.create"
+T_GET = "task.get"
+T_LIST = "task.list"
+T_CLAIM = "task.claim"
+T_RENEW = "task.renew"
+T_COMPLETE = "task.complete"
+T_FAIL = "task.fail"
+T_CANCEL = "task.cancel"
+
+CORE_PRIMITIVES = PRIMITIVES
+TASK_PRIMITIVES = frozenset({
+    T_CREATE, T_GET, T_LIST, T_CLAIM, T_RENEW, T_COMPLETE, T_FAIL, T_CANCEL,
+})
+PRIMITIVES = CORE_PRIMITIVES | TASK_PRIMITIVES
+
 # 信封属性（§2.2）
 ENVELOPE_ATTRS = ("v", "type", "seq", "ack", "ts", "from", "in_reply_to")
 

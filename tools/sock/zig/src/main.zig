@@ -691,6 +691,8 @@ const Conn = struct {
                 self.engine.mutex.unlock();
             },
             .err => {},
+            // §11：任务层只在 Python server 实现。回明确错误，不断开连接。
+            .task_unsupported => try self.sendError(env.seq, "AEVT-4110", "task.* methods are not supported by the Zig server; use the Python server (agent_sock.server)"),
         }
     }
 
