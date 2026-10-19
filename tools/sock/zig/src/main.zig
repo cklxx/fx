@@ -32,53 +32,12 @@ fn jsonEscape(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) 
     try out.append(alloc, '"');
 }
 
-const Wal = struct {
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    file: std.Io.File,
-    path: []const u8,
-    offset: u64,
-
-    fn open(alloc: std.mem.Allocator, io: std.Io, data_dir: []const u8) !Wal {
-        std.Io.Dir.createDirPath(std.Io.Dir.cwd(), io, data_dir) catch {};
-        var pb: [1024]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pb, "{s}/wal.jsonl", .{data_dir});
-        const path_owned = try alloc.dupe(u8, path);
-        errdefer alloc.free(path_owned);
-        const file = std.Io.Dir.openFile(std.Io.Dir.cwd(), io, path, .{ .mode = .write_only }) catch
-            try std.Io.Dir.createFile(std.Io.Dir.cwd(), io, path, .{ .truncate = false });
-        errdefer std.Io.File.close(file, io);
-        const st = try std.Io.File.stat(file, io);
-        return .{ .alloc = alloc, .io = io, .file = file, .path = path_owned, .offset = st.size };
-    }
-
-    fn close(self: *Wal) void {
-        std.Io.File.close(self.file, self.io);
-        self.alloc.free(self.path);
-    }
-
-    fn appendLine(self: *Wal, text: []const u8) !void {
-        try std.Io.File.writePositionalAll(self.file, self.io, text, self.offset);
-        self.offset += text.len;
-        try std.Io.File.writePositionalAll(self.file, self.io, "\n", self.offset);
-        self.offset += 1;
-        try std.Io.File.sync(self.file, self.io);
-    }
-
-    fn emit(self: *Wal, build: *std.ArrayList(u8)) void {
-        self.appendLine(build.items) catch {};
-    }
-
-    fn readAll(self: *Wal) ![]u8 {
-        const f = try std.Io.Dir.openFile(std.Io.Dir.cwd(), self.io, self.path, .{ .mode = .read_only });
-        defer std.Io.File.close(f, self.io);
-        const st = try std.Io.File.stat(f, self.io);
-        const buf = try self.alloc.alloc(u8, st.size);
-        errdefer self.alloc.free(buf);
-        _ = try std.Io.File.readPositionalAll(f, self.io, buf, 0);
-        return buf;
-    }
-};
+// The Wal type (append + group-commit fsync + torn-tail repair) lives in
+// server.zig so `zig build test` covers it. Records here:
+//   declare | pub | deliver(dlv) | ack | requeue(not_before_ms) | dead(reason)
+//   | cancel | cursor (legacy, ignored on replay)
+// Rule: a handler takes wal.lastSeq() under the engine lock, unlocks, then
+// calls wal.commit(seq) before it sends any reply or delivery.
 
 // ================= Engine =================
 
@@ -88,15 +47,35 @@ const Engine = struct {
     queues: std.StringHashMap(*srv.Queue),
     cancelled: srv.CancelledSet,
     next_delivery_id: u64 = 1,
-    wal: Wal,
+    wal: srv.Wal,
+    prng: std.Random.DefaultPrng,
 
-    fn init(alloc: std.mem.Allocator, wal: Wal) Engine {
+    fn init(alloc: std.mem.Allocator, wal: srv.Wal) Engine {
         return .{
             .alloc = alloc,
             .queues = std.StringHashMap(*srv.Queue).init(alloc),
             .cancelled = srv.CancelledSet.init(alloc),
             .wal = wal,
+            .prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(proto.nowNs())))),
         };
+    }
+
+    /// requeue_or_dead (S2): the single reentry path for timeout, leave and
+    /// ack+<requeue/>. Requeue sets a backoff deadline; the last attempt goes
+    /// to the dead-letter set. Call with the lock held. Returns true if dead.
+    fn reenter(self: *Engine, qname: []const u8, q: *srv.Queue, g: *srv.GroupState, mid: u64) bool {
+        const count = q.deliver_counts.get(mid) orelse 1;
+        if (srv.requeueOrDead(count, g.max_deliver) == .dead) {
+            const info = srv.DeadInfo{ .reason = .max_deliver, .deliver_count = count, .at_ms = proto.nowMs() };
+            g.markDead(mid, info) catch {};
+            self.walDead(qname, g.name, mid, info.reason);
+            return true;
+        }
+        const delay = srv.backoffDelayMs(count, g.backoff_base_ms, g.backoff_max_ms, self.prng.random().float(f64));
+        const until: i64 = if (delay == 0) 0 else proto.nowMs() + @as(i64, @intCast(delay));
+        g.markRequeued(mid, until) catch {};
+        self.walRequeue(qname, g.name, mid, until);
+        return false;
     }
 
     fn deinit(self: *Engine) void {
@@ -108,6 +87,12 @@ const Engine = struct {
         self.queues.deinit();
         self.cancelled.deinit();
         self.wal.close();
+    }
+
+    fn emit(self: *Engine, b: *std.ArrayList(u8)) void {
+        // On error the Wal goes fail-stop; the next commit() fails, so the
+        // handler replies AEVT-3001 instead of an ack.
+        _ = self.wal.append(self.alloc, b.items) catch {};
     }
 
     fn getQueue(self: *Engine, name: []const u8) ?*srv.Queue {
@@ -137,7 +122,7 @@ const Engine = struct {
         const sem_s: []const u8 = if (sem == .workqueue) "workqueue" else "topic";
         const ov_s: []const u8 = if (ov == .block) "block" else "drop_oldest";
         b.print(self.alloc, ",\"semantics\":\"{s}\",\"max_depth\":{d},\"overflow\":\"{s}\"{c}", .{ sem_s, max_depth, ov_s, '}' }) catch return;
-        self.wal.emit(&b);
+        self.emit(&b);
     }
 
     fn walPub(self: *Engine, queue: []const u8, mid: u64, id: []const u8, payload: []const u8) void {
@@ -154,18 +139,29 @@ const Engine = struct {
         b.appendSlice(self.alloc, ",\"payload\":\"") catch return;
         b.appendSlice(self.alloc, enc) catch return;
         b.appendSlice(self.alloc, "\"}") catch return;
-        self.wal.emit(&b);
+        self.emit(&b);
     }
 
-    fn walDeliver(self: *Engine, queue: []const u8, group: []const u8, mid: u64) void {
+    fn walDeliver(self: *Engine, queue: []const u8, group: []const u8, mid: u64, dlv: u64) void {
         var b = std.ArrayList(u8).empty;
         defer b.deinit(self.alloc);
         b.appendSlice(self.alloc, "{\"op\":\"deliver\",\"queue\":") catch return;
         jsonEscape(&b, self.alloc, queue) catch return;
         b.appendSlice(self.alloc, ",\"group\":") catch return;
         jsonEscape(&b, self.alloc, group) catch return;
-        b.print(self.alloc, ",\"mid\":{d}{c}", .{ mid, '}' }) catch return;
-        self.wal.emit(&b);
+        b.print(self.alloc, ",\"mid\":{d},\"dlv\":{d}{c}", .{ mid, dlv, '}' }) catch return;
+        self.emit(&b);
+    }
+
+    fn walRequeue(self: *Engine, queue: []const u8, group: []const u8, mid: u64, not_before_ms: i64) void {
+        var b = std.ArrayList(u8).empty;
+        defer b.deinit(self.alloc);
+        b.appendSlice(self.alloc, "{\"op\":\"requeue\",\"queue\":") catch return;
+        jsonEscape(&b, self.alloc, queue) catch return;
+        b.appendSlice(self.alloc, ",\"group\":") catch return;
+        jsonEscape(&b, self.alloc, group) catch return;
+        b.print(self.alloc, ",\"mid\":{d},\"not_before_ms\":{d}{c}", .{ mid, not_before_ms, '}' }) catch return;
+        self.emit(&b);
     }
 
     fn walAck(self: *Engine, queue: []const u8, group: []const u8, mid: u64) void {
@@ -176,7 +172,7 @@ const Engine = struct {
         b.appendSlice(self.alloc, ",\"group\":") catch return;
         jsonEscape(&b, self.alloc, group) catch return;
         b.print(self.alloc, ",\"mid\":{d}{c}", .{ mid, '}' }) catch return;
-        self.wal.emit(&b);
+        self.emit(&b);
     }
 
     fn walCursor(self: *Engine, queue: []const u8, group: []const u8, cursor: u64) void {
@@ -187,7 +183,7 @@ const Engine = struct {
         b.appendSlice(self.alloc, ",\"group\":") catch return;
         jsonEscape(&b, self.alloc, group) catch return;
         b.print(self.alloc, ",\"cursor\":{d}{c}", .{ cursor, '}' }) catch return;
-        self.wal.emit(&b);
+        self.emit(&b);
     }
 
     fn walCancel(self: *Engine, id: []const u8) void {
@@ -196,48 +192,39 @@ const Engine = struct {
         b.appendSlice(self.alloc, "{\"op\":\"cancel\",\"id\":") catch return;
         jsonEscape(&b, self.alloc, id) catch return;
         b.appendSlice(self.alloc, "}") catch return;
-        self.wal.emit(&b);
+        self.emit(&b);
     }
 
-    fn walDead(self: *Engine, queue: []const u8, group: []const u8, mid: u64) void {
+    fn walDead(self: *Engine, queue: []const u8, group: []const u8, mid: u64, reason: srv.DeadReason) void {
         var b = std.ArrayList(u8).empty;
         defer b.deinit(self.alloc);
         b.appendSlice(self.alloc, "{\"op\":\"dead\",\"queue\":") catch return;
         jsonEscape(&b, self.alloc, queue) catch return;
         b.appendSlice(self.alloc, ",\"group\":") catch return;
         jsonEscape(&b, self.alloc, group) catch return;
-        b.print(self.alloc, ",\"mid\":{d}{c}", .{ mid, '}' }) catch return;
-        self.wal.emit(&b);
+        b.print(self.alloc, ",\"mid\":{d},\"reason\":\"{s}\"{c}", .{ mid, reason.str(), '}' }) catch return;
+        self.emit(&b);
     }
 };
 
 // ================= WAL replay =================
 
 fn replayWal(e: *Engine) !void {
-    const content = e.wal.readAll() catch return;
+    const content = try e.wal.readAll(e.alloc);
     defer e.alloc.free(content);
 
-    // inflight: queue -> group -> list of mids delivered but not acked
-    var inflight = std.StringHashMap(std.StringHashMap(std.ArrayList(u64))).init(e.alloc);
-    defer {
-        var qit = inflight.iterator();
-        while (qit.next()) |qe| {
-            var git = qe.value_ptr.iterator();
-            while (git.next()) |ge| {
-                ge.value_ptr.deinit(e.alloc);
-                e.alloc.free(ge.key_ptr.*);
-            }
-            qe.value_ptr.deinit();
-            e.alloc.free(qe.key_ptr.*);
-        }
-        inflight.deinit();
-    }
-
+    var max_dlv: u64 = 0;
+    var n_deliver: u64 = 0;
+    var bad_lines: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        const parsed = std.json.parseFromSlice(std.json.Value, e.alloc, line, .{}) catch continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, e.alloc, line, .{}) catch {
+            bad_lines += 1;
+            continue;
+        };
         defer parsed.deinit();
+        if (parsed.value != .object) continue;
         const obj = parsed.value.object;
         const op_v = obj.get("op") orelse continue;
         if (op_v != .string) continue;
@@ -253,8 +240,15 @@ fn replayWal(e: *Engine) !void {
         const getU64 = struct {
             fn f(o: std.json.ObjectMap, k: []const u8) ?u64 {
                 const v = o.get(k) orelse return null;
-                if (v != .integer) return null;
+                if (v != .integer or v.integer < 0) return null;
                 return @intCast(v.integer);
+            }
+        }.f;
+        const getI64 = struct {
+            fn f(o: std.json.ObjectMap, k: []const u8) ?i64 {
+                const v = o.get(k) orelse return null;
+                if (v != .integer) return null;
+                return v.integer;
             }
         }.f;
 
@@ -264,69 +258,49 @@ fn replayWal(e: *Engine) !void {
             const md = getU64(obj, "max_depth") orelse 10000;
             const ov = getStr(obj, "overflow") orelse "block";
             _ = e.declareQueue(qn, if (std.mem.eql(u8, sem, "topic")) .topic else .workqueue, @intCast(md), if (std.mem.eql(u8, ov, "drop_oldest")) .drop_oldest else .block) catch continue;
-        } else if (std.mem.eql(u8, op, "pub")) {
-            const qn = getStr(obj, "queue") orelse continue;
+            continue;
+        }
+        if (std.mem.eql(u8, op, "cancel")) {
+            const id = getStr(obj, "id") orelse continue;
+            e.cancelled.add(id) catch continue;
+            continue;
+        }
+        const qn = getStr(obj, "queue") orelse continue;
+        const q = e.getQueue(qn) orelse continue;
+        if (std.mem.eql(u8, op, "pub")) {
             const id = getStr(obj, "id") orelse continue;
             const pb64 = getStr(obj, "payload") orelse continue;
-            const q = e.getQueue(qn) orelse continue;
             const dec_len = b64.Decoder.calcSizeForSlice(pb64) catch continue;
             const dec = e.alloc.alloc(u8, dec_len) catch continue;
             defer e.alloc.free(dec);
             b64.Decoder.decode(dec, pb64) catch continue;
             _ = q.publish(id, dec) catch continue;
-        } else if (std.mem.eql(u8, op, "deliver")) {
-            const qn = getStr(obj, "queue") orelse continue;
-            const gn = getStr(obj, "group") orelse continue;
-            const mid = getU64(obj, "mid") orelse continue;
-            const qe = try inflight.getOrPut(try e.alloc.dupe(u8, qn));
-            if (!qe.found_existing) qe.value_ptr.* = std.StringHashMap(std.ArrayList(u64)).init(e.alloc);
-            const ge = try qe.value_ptr.getOrPut(try e.alloc.dupe(u8, gn));
-            if (!ge.found_existing) ge.value_ptr.* = std.ArrayList(u64).empty;
-            try ge.value_ptr.append(e.alloc, mid);
-            // also bump deliver count so redelivery accounting survives restart
-            if (e.getQueue(qn)) |q| _ = q.noteDeliver(mid);
+            continue;
+        }
+        const gn = getStr(obj, "group") orelse continue;
+        const mid = getU64(obj, "mid") orelse continue;
+        const g = q.getOrCreateGroup(gn) catch continue;
+        if (std.mem.eql(u8, op, "deliver")) {
+            // Deliver count survives restart: max_deliver holds across crashes.
+            _ = q.noteDeliver(mid);
+            n_deliver += 1;
+            if (getU64(obj, "dlv")) |d| max_dlv = @max(max_dlv, d);
+            _ = g.not_before_ms.remove(mid);
         } else if (std.mem.eql(u8, op, "ack")) {
-            const qn = getStr(obj, "queue") orelse continue;
-            const gn = getStr(obj, "group") orelse continue;
-            const mid = getU64(obj, "mid") orelse continue;
-            if (inflight.getPtr(qn)) |qm| {
-                if (qm.getPtr(gn)) |gm| {
-                    var i: usize = 0;
-                    while (i < gm.items.len) {
-                        if (gm.items[i] == mid) {
-                            _ = gm.orderedRemove(i);
-                        } else i += 1;
-                    }
-                }
-            }
-        } else if (std.mem.eql(u8, op, "cursor")) {
-            const qn = getStr(obj, "queue") orelse continue;
-            const gn = getStr(obj, "group") orelse continue;
-            const cur = getU64(obj, "cursor") orelse continue;
-            if (e.getQueue(qn)) |q| {
-                const g = q.getOrCreateGroup(gn) catch continue;
-                g.cursor = @max(g.cursor, cur);
-            }
-        } else if (std.mem.eql(u8, op, "cancel")) {
-            const id = getStr(obj, "id") orelse continue;
-            e.cancelled.add(id) catch continue;
+            g.markAcked(mid) catch continue;
+        } else if (std.mem.eql(u8, op, "requeue")) {
+            g.markRequeued(mid, getI64(obj, "not_before_ms") orelse 0) catch continue;
+        } else if (std.mem.eql(u8, op, "dead")) {
+            const reason = srv.DeadReason.parse(getStr(obj, "reason") orelse "max_deliver");
+            g.markDead(mid, .{ .reason = reason, .deliver_count = q.deliver_counts.get(mid) orelse 0, .at_ms = 0 }) catch continue;
         }
-        // "dead": no state change needed
+        // "cursor": legacy record, ignored. Messages that were in flight at
+        // crash time are neither done nor in flight now, so they redeliver.
     }
-
-    // Pull cursors back over crash-time in-flight messages so they redeliver.
-    var qit = inflight.iterator();
-    while (qit.next()) |qe| {
-        const q = e.getQueue(qe.key_ptr.*) orelse continue;
-        var git = qe.value_ptr.iterator();
-        while (git.next()) |ge| {
-            if (ge.value_ptr.items.len == 0) continue;
-            const g = q.getOrCreateGroup(ge.key_ptr.*) catch continue;
-            var min_mid: u64 = std.math.maxInt(u64);
-            for (ge.value_ptr.items) |m| min_mid = @min(min_mid, m);
-            g.cursor = @min(g.cursor, min_mid);
-        }
-    }
+    // Delivery ids must not repeat across restarts: a stale ack for an old
+    // id must not hit a new delivery.
+    e.next_delivery_id = @max(max_dlv, n_deliver) + 1;
+    if (bad_lines > 0) std.debug.print("wal replay: skipped {d} corrupt line(s)\n", .{bad_lines});
 }
 
 // ================= timeout sweeper =================
@@ -352,14 +326,8 @@ fn sweeperMain(e: *Engine) void {
                 }
                 for (expired.items) |dlv| {
                     if (g.pending.fetchRemove(dlv)) |kv| {
-                        const count = q.deliver_counts.get(kv.value.mid) orelse 1;
                         e.alloc.free(kv.value.consumer);
-                        if (srv.requeueOrDead(count, g.max_deliver) == .requeued) {
-                            g.cursor = @min(g.cursor, kv.value.mid);
-                            e.walCursor(qe.key_ptr.*, g.name, g.cursor);
-                        } else {
-                            e.walDead(qe.key_ptr.*, g.name, kv.value.mid);
-                        }
+                        _ = e.reenter(qe.key_ptr.*, q, g, kv.value.mid);
                     }
                 }
                 expired.deinit(e.alloc);
@@ -389,20 +357,56 @@ fn recycleConsumer(e: *Engine, from: []const u8) void {
             }
             for (todrop.items) |dlv| {
                 if (g.pending.fetchRemove(dlv)) |kv| {
-                    const count = q.deliver_counts.get(kv.value.mid) orelse 1;
                     e.alloc.free(kv.value.consumer);
-                    if (srv.requeueOrDead(count, g.max_deliver) == .requeued) {
-                        g.cursor = @min(g.cursor, kv.value.mid);
-                        e.walCursor(qe.key_ptr.*, g.name, g.cursor);
-                    } else {
-                        e.walDead(qe.key_ptr.*, g.name, kv.value.mid);
-                    }
+                    _ = e.reenter(qe.key_ptr.*, q, g, kv.value.mid);
                 }
             }
             todrop.deinit(e.alloc);
             if (g.members.fetchRemove(from)) |kv| e.alloc.free(kv.key);
         }
     }
+}
+
+fn parseSecondsMs(t: []const u8) ?u64 {
+    const v = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " \t\r\n")) catch return null;
+    if (!(v >= 0) or v > 1e9) return null;
+    return @intFromFloat(v * 1000.0);
+}
+
+/// `asock-server --dlq <queue>`: replay the WAL read-only and print the
+/// dead letters of <queue> as JSON lines. Safe while a server runs.
+fn printDlq(e: *Engine, io: std.Io, queue: []const u8) !void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    const w = &stdout.interface;
+    const q = e.getQueue(queue) orelse {
+        try w.print("{{\"queue\":\"{s}\",\"error\":\"not found\"}}\n", .{queue});
+        try w.flush();
+        return;
+    };
+    var git = q.groups.iterator();
+    while (git.next()) |ge| {
+        const g = ge.value_ptr.*;
+        var dit = g.dead.iterator();
+        while (dit.next()) |de| {
+            const mid = de.key_ptr.*;
+            var id: []const u8 = "";
+            for (q.messages.items) |m| {
+                if (m.mid == mid) id = m.message_id;
+            }
+            var b = std.ArrayList(u8).empty;
+            defer b.deinit(e.alloc);
+            try b.appendSlice(e.alloc, "{\"queue\":");
+            try jsonEscape(&b, e.alloc, queue);
+            try b.appendSlice(e.alloc, ",\"group\":");
+            try jsonEscape(&b, e.alloc, g.name);
+            try b.print(e.alloc, ",\"mid\":{d},\"message_id\":", .{mid});
+            try jsonEscape(&b, e.alloc, id);
+            try b.print(e.alloc, ",\"reason\":\"{s}\",\"deliver_count\":{d}}}", .{ de.value_ptr.reason.str(), de.value_ptr.deliver_count });
+            try w.print("{s}\n", .{b.items});
+        }
+    }
+    try w.flush();
 }
 
 // ================= connection =================
@@ -462,6 +466,15 @@ const Conn = struct {
         try writer.interface.flush();
     }
 
+    /// Wait for the WAL to cover `seq`. On failure send AEVT-3001 and return
+    /// null (the caller must not reply with success).
+    fn commitOrError(self: *Conn, in_reply_to: u64, seq: u64) !?void {
+        self.engine.wal.commit(self.io, seq) catch {
+            try self.sendError(in_reply_to, "AEVT-3001", "wal write failed");
+            return null;
+        };
+    }
+
     fn textOf(self: *Conn, msg: *proto.Message, name: []const u8) !?[]u8 {
         const el = msg.root.child(name) orelse return null;
         return try el.textContent(self.alloc);
@@ -504,7 +517,9 @@ const Conn = struct {
                     return;
                 };
                 if (created) self.engine.walDeclare(qt, semantics, max_depth, overflow);
+                const seq = self.engine.wal.lastSeq();
                 self.engine.mutex.unlock();
+                try self.commitOrError(env.seq, seq) orelse return;
                 try self.sendXml(.queue_declare, env.seq, "<ok/>");
             },
             .queue_publish => {
@@ -524,7 +539,9 @@ const Conn = struct {
                     self.engine.mutex.lock();
                     self.engine.cancelled.add(task_id) catch {};
                     self.engine.walCancel(task_id);
+                    const seq = self.engine.wal.lastSeq();
                     self.engine.mutex.unlock();
+                    try self.commitOrError(env.seq, seq) orelse return;
                     try self.sendXml(.queue_publish, env.seq, "<cancelled>true</cancelled>");
                     return;
                 }
@@ -541,7 +558,10 @@ const Conn = struct {
                     return;
                 };
                 if (mid != 0) self.engine.walPub(qt, mid, mid_t, p_t);
+                const seq = self.engine.wal.lastSeq();
                 self.engine.mutex.unlock();
+                // Fsync before the publish reply: an acked publish survives a crash.
+                try self.commitOrError(env.seq, seq) orelse return;
                 var body_buf: [128]u8 = undefined;
                 const body = try std.fmt.bufPrint(&body_buf, "<mid>{d}</mid><duplicate>{s}</duplicate>", .{ mid, if (mid == 0) "true" else "false" });
                 try self.sendXml(.queue_publish, env.seq, body);
@@ -569,6 +589,17 @@ const Conn = struct {
                     max_deliver = std.fmt.parseInt(u32, std.mem.trim(u8, md_t, " \t\r\n"), 10) catch
                         return self.sendError(env.seq, "AEVT-4007", "bad max_deliver");
                 }
+                // Backoff in seconds (same field names as the Python server).
+                var backoff_base_ms: ?u64 = null;
+                if (try self.textOf(msg, "backoff_base_s")) |t| {
+                    defer self.alloc.free(t);
+                    backoff_base_ms = parseSecondsMs(t) orelse return self.sendError(env.seq, "AEVT-4007", "bad backoff_base_s");
+                }
+                var backoff_max_ms: ?u64 = null;
+                if (try self.textOf(msg, "backoff_max_s")) |t| {
+                    defer self.alloc.free(t);
+                    backoff_max_ms = parseSecondsMs(t) orelse return self.sendError(env.seq, "AEVT-4007", "bad backoff_max_s");
+                }
 
                 self.engine.mutex.lock();
                 const q = self.engine.getQueue(qt);
@@ -591,6 +622,8 @@ const Conn = struct {
                 };
                 group.ack_wait_s = ack_wait_s;
                 group.max_deliver = max_deliver;
+                if (backoff_base_ms) |v| group.backoff_base_ms = v;
+                if (backoff_max_ms) |v| group.backoff_max_ms = v;
                 if (!group.members.contains(env.from)) {
                     const from_copy = self.alloc.dupe(u8, env.from) catch {
                         self.engine.mutex.unlock();
@@ -604,7 +637,7 @@ const Conn = struct {
                 }
                 var deliver_body: ?[]u8 = null;
                 defer if (deliver_body) |d| self.alloc.free(d);
-                if (q.?.nextForGroup(group, &self.engine.cancelled)) |m| {
+                if (q.?.nextForGroup(group, &self.engine.cancelled, proto.nowMs())) |m| {
                     const dcnt = q.?.noteDeliver(m.mid);
                     const dlv_id = self.engine.next_delivery_id;
                     self.engine.next_delivery_id += 1;
@@ -622,7 +655,8 @@ const Conn = struct {
                         self.engine.mutex.unlock();
                         return;
                     };
-                    group.cursor = @max(group.cursor, m.mid + 1);
+                    group.inflight.put(m.mid, {}) catch {};
+                    _ = group.not_before_ms.remove(m.mid);
                     var w = proto.XmlWriter.init(self.alloc);
                     defer w.deinit();
                     var dbuf: [64]u8 = undefined;
@@ -633,11 +667,13 @@ const Conn = struct {
                     w.element("message_id", m.message_id) catch {};
                     w.elementCdata("payload", m.payload) catch {};
                     deliver_body = w.buf.toOwnedSlice(self.alloc) catch null;
-                    self.engine.walDeliver(qt, group.name, m.mid);
-                    self.engine.walCursor(qt, group.name, group.cursor);
+                    self.engine.walDeliver(qt, group.name, m.mid, dlv_id);
                 }
+                const seq = self.engine.wal.lastSeq();
                 self.engine.mutex.unlock();
                 if (deliver_body) |dx| {
+                    // Deliver count is on disk before the consumer sees it.
+                    try self.commitOrError(env.seq, seq) orelse return;
                     try self.sendXml(.queue_deliver, null, dx);
                 }
             },
@@ -665,30 +701,42 @@ const Conn = struct {
                 const dash = std.mem.indexOfScalar(u8, dlv_t, '-') orelse return;
                 const dlv_id = std.fmt.parseInt(u64, std.mem.trim(u8, dlv_t[dash + 1 ..], " \t\r\n"), 10) catch return;
                 const requeue = msg.root.child("requeue") != null;
+                const reject = msg.root.child("reject") != null; // straight to dead letters
+                if (requeue and reject) return self.sendError(env.seq, "AEVT-4007", "requeue and reject are exclusive");
                 self.engine.mutex.lock();
                 const q = self.engine.getQueue(qt) orelse {
                     self.engine.mutex.unlock();
-                    return;
+                    return self.sendError(env.seq, "AEVT-4006", "queue not declared");
                 };
                 const group = q.groups.get(std.mem.trim(u8, grp_t, " \t\r\n")) orelse {
                     self.engine.mutex.unlock();
-                    return;
+                    return self.sendError(env.seq, "AEVT-4007", "unknown group");
                 };
+                var result: []const u8 = "acked";
                 if (group.pending.fetchRemove(dlv_id)) |kv| {
-                    const count = q.deliver_counts.get(kv.value.mid) orelse 1;
                     self.alloc.free(kv.value.consumer);
-                    if (requeue) {
-                        if (srv.requeueOrDead(count, group.max_deliver) == .requeued) {
-                            group.cursor = @min(group.cursor, kv.value.mid);
-                            self.engine.walCursor(qt, group.name, group.cursor);
-                        } else {
-                            self.engine.walDead(qt, group.name, kv.value.mid);
-                        }
+                    const mid = kv.value.mid;
+                    if (reject) {
+                        const info = srv.DeadInfo{ .reason = .rejected, .deliver_count = q.deliver_counts.get(mid) orelse 1, .at_ms = proto.nowMs() };
+                        group.markDead(mid, info) catch {};
+                        self.engine.walDead(qt, group.name, mid, .rejected);
+                        result = "dead";
+                    } else if (requeue) {
+                        result = if (self.engine.reenter(qt, q, group, mid)) "dead" else "queued";
                     } else {
-                        self.engine.walAck(qt, group.name, kv.value.mid);
+                        group.markAcked(mid) catch {};
+                        self.engine.walAck(qt, group.name, mid);
                     }
+                } else {
+                    self.engine.mutex.unlock();
+                    return self.sendError(env.seq, "AEVT-4007", "ack on non-pending delivery");
                 }
+                const seq = self.engine.wal.lastSeq();
                 self.engine.mutex.unlock();
+                // Reply only after the ack record is on disk.
+                try self.commitOrError(env.seq, seq) orelse return;
+                var rb: [64]u8 = undefined;
+                try self.sendXml(.queue_ack, env.seq, std.fmt.bufPrint(&rb, "<ok>true</ok><result>{s}</result>", .{result}) catch "<ok>true</ok>");
             },
             .err => {},
         }
@@ -719,14 +767,37 @@ pub fn main(init: std.process.Init) !void {
     const sock_path = ".agent-sock/agent.sock";
     const data_dir = ".agent-sock/data";
 
-    const wal = try Wal.open(alloc, io, data_dir);
+    var dlq_queue: ?[]const u8 = null;
+    var fsync_enabled = true;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    var ai: usize = 1;
+    while (ai < args.len) : (ai += 1) {
+        if (std.mem.eql(u8, args[ai], "--dlq") and ai + 1 < args.len) {
+            dlq_queue = args[ai + 1];
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--no-fsync")) {
+            fsync_enabled = false; // measurement only: unsafe
+        }
+    }
+
+    if (dlq_queue) |qn| {
+        const ro = try srv.Wal.open(data_dir, "wal.jsonl", false, true);
+        var ro_engine = Engine.init(alloc, ro);
+        defer ro_engine.deinit();
+        try replayWal(&ro_engine);
+        try printDlq(&ro_engine, io, qn);
+        return;
+    }
+
+    const wal = try srv.Wal.open(data_dir, "wal.jsonl", fsync_enabled, false);
+    if (wal.torn_bytes > 0) std.debug.print("wal: truncated {d} torn byte(s)\n", .{wal.torn_bytes});
     var engine = Engine.init(alloc, wal);
     defer engine.deinit();
 
     // Replay before declaring defaults: replay recreates queues from WAL.
-    replayWal(&engine) catch |e| {
-        std.debug.print("wal replay failed: {s}\n", .{@errorName(e)});
-    };
+    // A replay error is fatal: serving from a partial state would ack
+    // publishes on top of lost ones.
+    try replayWal(&engine);
 
     engine.mutex.lock();
     if (try engine.declareQueue("task.dispatch", .workqueue, 10000, .block))
@@ -735,7 +806,9 @@ pub fn main(init: std.process.Init) !void {
         engine.walDeclare("events", .topic, 100000, .drop_oldest);
     if (try engine.declareQueue("approval.requests", .workqueue, 10000, .block))
         engine.walDeclare("approval.requests", .workqueue, 10000, .block);
+    const decl_seq = engine.wal.lastSeq();
     engine.mutex.unlock();
+    try engine.wal.commit(io, decl_seq);
 
     // Timeout sweeper (ack_wait expiry -> requeue_or_dead).
     const sweeper = try std.Thread.spawn(.{}, sweeperMain, .{&engine});
