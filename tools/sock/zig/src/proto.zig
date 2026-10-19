@@ -63,6 +63,8 @@ pub const Primitive = enum {
     queue_deliver,
     queue_ack,
     err,
+    /// §11 任务层 task.* 原语。Zig server 不实现，只识别后回 AEVT-4110。
+    task_unsupported,
 
     pub fn wireName(self: Primitive) []const u8 {
         return switch (self) {
@@ -77,6 +79,7 @@ pub const Primitive = enum {
             .queue_deliver => "queue.deliver",
             .queue_ack => "queue.ack",
             .err => "error",
+            .task_unsupported => "task.unsupported",
         };
     }
 
@@ -92,6 +95,7 @@ pub const Primitive = enum {
         if (std.mem.eql(u8, name, "queue.deliver")) return .queue_deliver;
         if (std.mem.eql(u8, name, "queue.ack")) return .queue_ack;
         if (std.mem.eql(u8, name, "error")) return .err;
+        if (std.mem.startsWith(u8, name, "task.")) return .task_unsupported;
         return ProtoError.UnknownPrimitive;
     }
 };
@@ -676,4 +680,10 @@ test "frame and payload limits sane" {
     try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), max_frame_bytes);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), max_payload_bytes);
     try std.testing.expect(max_payload_bytes < max_frame_bytes);
+}
+
+test "task.* maps to task_unsupported (Zig server rejects with AEVT-4110)" {
+    try std.testing.expectEqual(Primitive.task_unsupported, try Primitive.fromWireName("task.claim"));
+    try std.testing.expectEqual(Primitive.task_unsupported, try Primitive.fromWireName("task.create"));
+    try std.testing.expectError(ProtoError.UnknownPrimitive, Primitive.fromWireName("bogus.x"));
 }
