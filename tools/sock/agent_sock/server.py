@@ -59,6 +59,7 @@ class Server:
         # §11 共享任务列表。启动时重放 tasks/log.jsonl。
         self.tasks = TaskList(os.path.join(self.data_dir, "tasks"))
         self.tasks.on_exhausted = self._on_task_exhausted
+        self.tasks.on_dep_failed = self._on_task_dep_failed
         self._pending_task_events: list[tuple[str, dict]] = []
 
     # ---- 启动
@@ -574,6 +575,12 @@ class Server:
                                {"task_id": t.task_id,
                                 "attempts": str(t.attempts),
                                 "error": t.error})
+
+    def _on_task_dep_failed(self, t, dep: str):
+        self._queue_task_event("task.failed",
+                               {"task_id": t.task_id, "state": t.state,
+                                "error": t.error, "reason": "dep_failed",
+                                "dep": dep})
 
     async def _task_reply(self, writer, msg: Message, body: dict,
                           cdata: dict | None = None):

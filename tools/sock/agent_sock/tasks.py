@@ -36,6 +36,7 @@ MAX_LEASE_S = 3600.0
 DEFAULT_MAX_ATTEMPTS = 3
 
 # 日志记录类型（字段 "rec"）。fix 的持久化工作要覆盖这些记录。
+# task.fail 也用于依赖失败级联（附加字段 reason=dep_failed、dep）。
 RECORD_TYPES = ("task.create", "task.claim", "task.renew", "task.complete",
                 "task.fail", "task.expire", "task.cancel")
 
@@ -74,6 +75,8 @@ class TaskList:
         self._seq = 0
         # 钩子：attempts 用尽时调用 hook(task)。fix 的死信路径接在这里。
         self.on_exhausted = None
+        # 钩子：依赖失败级联时调用 hook(task, dep_id)。server 用它发事件。
+        self.on_dep_failed = None
         os.makedirs(data_dir, exist_ok=True)
         self._load()
 
@@ -326,8 +329,10 @@ class TaskList:
         to = PENDING if retry and t.attempts < t.max_attempts else FAILED
         self._commit({"rec": "task.fail", "task_id": task_id, "token": token,
                       "to": to, "error": error})
-        if to == FAILED and retry:
-            self._exhausted(t)
+        if to == FAILED:
+            if retry:
+                self._exhausted(t)
+            self._cascade(task_id)
         return t
 
     def cancel(self, task_id: str) -> Task:
@@ -338,6 +343,7 @@ class TaskList:
             raise errors.make("AEVT-4105", f"task {task_id} already {t.state}")
         self._commit({"rec": "task.cancel", "task_id": task_id,
                       "token": t.token})
+        self._cascade(task_id)
         return t
 
     # ---- 租约过期
@@ -355,8 +361,34 @@ class TaskList:
                               else "lease expired; max attempts reached"})
                 if to == FAILED:
                     self._exhausted(t)
+                    self._cascade(t.task_id)
                 changed.append(t)
         return changed
+
+    def _cascade(self, root_id: str) -> list[tuple[Task, str]]:
+        """root 到了 failed/cancelled：所有仍 pending 的传递依赖方转 failed，
+        error=dep_failed:<直接依赖 id>。每个变化的任务一条 task.fail 记录，
+        先写盘再改内存。重放时这些记录照原样重现状态。"""
+        out: list[tuple[Task, str]] = []
+        frontier = [root_id]
+        while frontier:
+            dep = frontier.pop(0)
+            for did in sorted(self.dependents.get(dep, ()),
+                              key=lambda x: self.tasks[x].created_seq):
+                d = self.tasks[did]
+                assert d.state != CLAIMED, \
+                    f"dependent {did} claimed while dep {dep} not completed"
+                if d.state != PENDING:
+                    continue
+                self._commit({"rec": "task.fail", "task_id": did,
+                              "token": d.token, "to": FAILED,
+                              "error": f"dep_failed:{dep}",
+                              "reason": "dep_failed", "dep": dep})
+                out.append((d, dep))
+                if self.on_dep_failed is not None:
+                    self.on_dep_failed(d, dep)
+                frontier.append(did)
+        return out
 
     def _exhausted(self, t: Task) -> None:
         """死信钩子（不实现死信本身）。"""

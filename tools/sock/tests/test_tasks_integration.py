@@ -107,6 +107,37 @@ class TaskIntegration(unittest.IsolatedAsyncioTestCase):
         ev = next(e for e in events if e["subject"] == "task.unblocked")
         self.assertEqual(ev["data"], {"task_id": "b", "by": "a"})
 
+    async def test_dep_failed_cascade(self):
+        c = await self.client("orch")
+        events = []
+
+        async def on_d(m):
+            if m.body.get("queue") == "events":
+                events.append(json.loads(m.body.get("payload") or "{}"))
+        c.on_deliver(on_d)
+        await c._request("queue.consume", {"queue": "events"})
+        await c.task_create_batch([{"task_id": "a"},
+                                   {"task_id": "b", "deps": ["a"]},
+                                   {"task_id": "c", "deps": ["b"]}])
+        cl = await c.task_claim("a")
+        self.assertEqual(await c.task_fail("a", cl["token"], "boom"), "failed")
+        self.assertEqual((await c.task_get("c"))["error"], "dep_failed:b")
+        await asyncio.sleep(0.3)
+        dep_evs = [e["data"] for e in events if e["subject"] == "task.failed"
+                   and e["data"].get("reason") == "dep_failed"]
+        self.assertEqual([(d["task_id"], d["dep"]) for d in dep_evs],
+                         [("b", "a"), ("c", "b")])
+        for x in self.clients:
+            x._closed = True
+        self.srv.kill9()
+        self.srv.p.stderr.close()
+        self.srv.start()
+        c2 = await self.client("after")
+        st = {t["task_id"]: (t["state"], t["error"]) for t in await c2.task_list()}
+        self.assertEqual(st, {"a": ("failed", "boom"),
+                              "b": ("failed", "dep_failed:a"),
+                              "c": ("failed", "dep_failed:b")})
+
     async def test_cycle_rejected(self):
         c = await self.client("orch")
         with self.assertRaises(ClientError) as ctx:

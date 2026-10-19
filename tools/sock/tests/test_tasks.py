@@ -195,6 +195,76 @@ class TestTaskList(unittest.TestCase):
         self.assertEqual(self.code(ctx), "AEVT-4007")
 
 
+class TestDepFailed(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.tl = TaskList(self.tmp, now=self.clock)
+        self.hits = []
+        self.tl.on_dep_failed = lambda t, d: self.hits.append((t.task_id, d))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def states(self, tl=None):
+        tl = tl or self.tl
+        return {t.task_id: (t.state, t.error) for t in tl.list()}
+
+    def test_chain_fail(self):
+        self.tl.create([{"task_id": "A"}, {"task_id": "B", "deps": ["A"]},
+                        {"task_id": "C", "deps": ["B"]}])
+        a = self.tl.claim("w", "A")
+        self.tl.fail("A", a.token, "boom")
+        st = self.states()
+        self.assertEqual(st["B"], (FAILED, "dep_failed:A"))
+        self.assertEqual(st["C"], (FAILED, "dep_failed:B"))
+        self.assertEqual(self.hits, [("B", "A"), ("C", "B")])
+        self.assertEqual(self.states(TaskList(self.tmp, now=self.clock)), st)
+
+    def test_diamond_cancel(self):
+        self.tl.create([{"task_id": "A"}, {"task_id": "B", "deps": ["A"]},
+                        {"task_id": "C", "deps": ["A"]},
+                        {"task_id": "D", "deps": ["B", "C"]},
+                        {"task_id": "E"}])
+        self.tl.cancel("A")
+        st = self.states()
+        self.assertEqual(st["A"][0], CANCELLED)
+        self.assertEqual(st["B"], (FAILED, "dep_failed:A"))
+        self.assertEqual(st["C"], (FAILED, "dep_failed:A"))
+        self.assertEqual(st["D"], (FAILED, "dep_failed:B"))  # 只记一次
+        self.assertEqual(st["E"][0], PENDING)
+        self.assertEqual(len(self.hits), 3)
+        with open(os.path.join(self.tmp, "log.jsonl")) as f:
+            recs = [l for l in f if '"dep_failed"' in l]
+        self.assertEqual(len(recs), 3)  # 每个变化的任务一条记录
+        self.assertEqual(self.states(TaskList(self.tmp, now=self.clock)), st)
+
+    def test_exhaust_trigger(self):
+        self.tl.create([{"task_id": "A", "max_attempts": 1},
+                        {"task_id": "B", "deps": ["A"]}])
+        self.tl.claim("w", "A", lease_s=1)
+        self.clock.t += 2
+        self.tl.sweep()
+        self.assertEqual(self.states()["B"], (FAILED, "dep_failed:A"))
+        self.assertEqual(self.states(TaskList(self.tmp, now=self.clock)),
+                         self.states())
+
+    def test_retry_fail_does_not_cascade(self):
+        self.tl.create([{"task_id": "A", "max_attempts": 2},
+                        {"task_id": "B", "deps": ["A"]}])
+        a = self.tl.claim("w", "A")
+        self.tl.fail("A", a.token, "x", retry=True)
+        self.assertEqual(self.states()["B"][0], PENDING)
+
+    def test_partial_completed_dep_still_cascades(self):
+        self.tl.create([{"task_id": "A"}, {"task_id": "X"},
+                        {"task_id": "B", "deps": ["A", "X"]}])
+        a = self.tl.claim("w", "A")
+        self.tl.complete("A", a.token)
+        self.tl.cancel("X")
+        self.assertEqual(self.states()["B"], (FAILED, "dep_failed:X"))
+
+
 class TestGate(unittest.TestCase):
     def test_gate(self):
         check_gate({"task_id": "t", "state": "completed",

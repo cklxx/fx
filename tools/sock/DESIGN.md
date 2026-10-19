@@ -591,6 +591,7 @@ v4.1（2026-10-19，任务层）：
 |---|------|------|
 | 72 | 新增 §11 任务层：8 个 `task.*` 扩展原语，共享任务列表，租约 + fencing token，每次认领一个 worktree | 第一性排序关键项 1、2 |
 | 73 | 新增错误码 AEVT-4101/4102/4103/4104/4105/4107/4110 | §11.5 |
+| 75 | 依赖失败级联：依赖 failed/cancelled 时，pending 的传递依赖方转 failed（`dep_failed:<id>`） | §11.3 |
 | 74 | Zig server 识别 `task.*`，回 AEVT-4110，不断开连接 | §11.7 |
 
 v4（2026-10-11，REVIEW 25 项全量修复）：
@@ -681,7 +682,8 @@ pending/claimed --cancel--> cancelled
 规则：
 - 只有 `pending` 且全部依赖为 `completed` 的任务可以认领。
 - `completed`、`failed`、`cancelled` 是终态。
-- 依赖为 `failed` 或 `cancelled` 的任务一直不可认领。上层决定怎么处理。
+- 依赖失败级联：一个任务到达 `failed` 或 `cancelled`（包括 attempts 用尽）时，server 把它的全部传递依赖方中仍为 `pending` 的任务转为 `failed`。`error` = `dep_failed:<直接依赖 id>`。`fail retry=true` 回 `pending` 时不级联。
+- 级联时依赖方不可能是 `claimed`（依赖未完成就不可认领）。server 用 assert 检查这一点。
 - server 每 1 秒扫描一次租约。每个任务操作之前也扫描一次。
 
 ### 11.4 原语（8 个扩展原语）
@@ -742,7 +744,7 @@ server 不运行 git。server 只计算路径。
 
 - 文件：`<data_dir>/tasks/log.jsonl`，append-only，每行一条 JSON 记录。
 - 写入顺序：先 append 记录，再改内存，再回应答。
-- 记录类型（字段 `rec`）：`task.create`、`task.claim`（含 `token`、`holder`、`lease_expires_at`、`attempts`、`workdir`）、`task.renew`、`task.complete`（含 `token`、`result`）、`task.fail`（含 `to`）、`task.expire`（含 `to`）、`task.cancel`。
+- 记录类型（字段 `rec`）：`task.create`、`task.claim`（含 `token`、`holder`、`lease_expires_at`、`attempts`、`workdir`）、`task.renew`、`task.complete`（含 `token`、`result`）、`task.fail`（含 `to`；依赖失败级联时另含 `reason=dep_failed`、`dep`，每个变化的任务一条）、`task.expire`（含 `to`）、`task.cancel`。
 - 唯一写盘入口：`TaskList._append_log`。刷盘点：`TaskList.flush()`，由 server 的 `_wal_flush` 调用。现在 `flush()` 是空操作。持久化工作（fsync）要覆盖这两处。
 - 恢复：启动时按顺序重放日志。重放和运行用同一个函数（`_apply`）。
 - token 从日志中的 `task.claim` 记录恢复。所以重启后 token 不回退。
@@ -751,7 +753,7 @@ server 不运行 git。server 只计算路径。
 
 ### 11.8 事件
 
-server 在 `events` topic 上发以下 subject：`task.created`、`task.claimed`、`task.completed`、`task.unblocked`（`{task_id, by}`）、`task.failed`、`task.expired`、`task.cancelled`（`source=tasklist`）、`task.exhausted`。等待方订阅 `events` 即可。
+server 在 `events` topic 上发以下 subject：`task.created`、`task.claimed`、`task.completed`、`task.unblocked`（`{task_id, by}`）、`task.failed`（级联时含 `reason=dep_failed`、`dep`）、`task.expired`、`task.cancelled`（`source=tasklist`）、`task.exhausted`。等待方订阅 `events` 即可。
 
 ### 11.9 死信钩子
 
@@ -774,5 +776,5 @@ Zig server 不实现任务层。Zig server 把所有 `task.*` 原语识别为 `t
 
 ### 11.13 测试
 
-- `tests/test_tasks.py`（单元，假时钟）：依赖和解锁、环、幂等、租约过期和 fencing、续租、attempts 用尽钩子、fail retry、取消、恢复和 token 单调、半行日志、每次认领的 workdir、merge gate 判定。
-- `tests/test_tasks_integration.py`（真实 server 子进程）：解锁事件、环、10 个 worker 并发认领、过期 worker 被拒、续租和 tick 过期、kill -9 重启恢复、worktree merge gate。
+- `tests/test_tasks.py`（单元，假时钟）：依赖失败级联（链、菱形、取消和用尽触发、重放）、依赖和解锁、环、幂等、租约过期和 fencing、续租、attempts 用尽钩子、fail retry、取消、恢复和 token 单调、半行日志、每次认领的 workdir、merge gate 判定。
+- `tests/test_tasks_integration.py`（真实 server 子进程）：解锁事件、环、10 个 worker 并发认领、过期 worker 被拒、续租和 tick 过期、kill -9 重启恢复、依赖失败级联和重启后重放、worktree merge gate。
