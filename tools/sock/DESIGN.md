@@ -496,6 +496,13 @@ steps:
 | AEVT-4006 | 队列未声明 | 需人工（先 declare） |
 | AEVT-4007 | 参数错误：declare 冲突 / topic 携带 ack 参数 / 收件箱 group 非 inbox | 需人工（修正参数） |
 | AEVT-4008 | resume 时会话已标 lost | 可重试（重建状态后重连） |
+| AEVT-4101 | fencing token 过期（租约失效或任务已被他人认领） | 需人工（丢弃本次结果） |
+| AEVT-4102 | 任务不存在 | 需人工 |
+| AEVT-4103 | 依赖不存在或依赖成环 | 需人工（修正依赖） |
+| AEVT-4104 | 任务不可认领（不是 pending 或依赖未完成） | 可重试 |
+| AEVT-4105 | 任务状态不允许该操作（已终态/已取消） | 需人工 |
+| AEVT-4107 | task_id 重复 | 需人工 |
+| AEVT-4110 | 本 server 不支持 task.*（Zig server） | 需人工（改用 Python server） |
 | ATMUX-1001/1002 | tmux 未安装/server 失联 | 需人工 |
 | ATMUX-2001 | pane 命令超时 | 可重试 |
 | APIPE-1001 | 编译期错误（变量未定义等） | 致命（不执行） |
@@ -532,6 +539,8 @@ tools/sock/  (cklxx/fx)
     server.py     # sock server + 队列引擎 + 注册表
     client.py     # 重连、心跳、submit/stream/subscribe（封装 queue.*）
     queue.py      # workqueue/topic：group、PEL、requeue_or_dead、死信、背压、compaction
+    tasks.py      # §11 共享任务列表：依赖、原子认领、租约、fencing token
+    worktree.py   # §11 每次认领一个 git worktree + merge gate（只在 client 侧）
     tmux_tool.py
     pipeline.py   # DSL 解析 + 编译器（bash/XML 双目标，CEL 子集）
     cli.py        # asock serve/submit/tail/events/snapshot/resume/queue
@@ -575,6 +584,14 @@ REVIEW §5 已全部裁决，无需用户拍板。结论如下：
 ---
 
 ## 10. 修订记录
+
+v4.1（2026-10-19，任务层）：
+
+| # | 修订 | 对应 |
+|---|------|------|
+| 72 | 新增 §11 任务层：8 个 `task.*` 扩展原语，共享任务列表，租约 + fencing token，每次认领一个 worktree | 第一性排序关键项 1、2 |
+| 73 | 新增错误码 AEVT-4101/4102/4103/4104/4105/4107/4110 | §11.5 |
+| 74 | Zig server 识别 `task.*`，回 AEVT-4110，不断开连接 | §11.7 |
 
 v4（2026-10-11，REVIEW 25 项全量修复）：
 
@@ -628,3 +645,134 @@ v3（2026-10-10，用户拍板 S1–S4 全采纳 + 深度简化）：
 | 46 | 协议章按 ASD-STE100 重写：术语表 + 每原语 schema/一句话/一示例 | 用户要求 |
 
 v2.1 修订见 git 历史。v2 修订（SOTA 合入 #1–#24）见 git 历史。
+
+
+---
+
+## 11. 任务层（v4.1）
+
+### 11.1 目的
+
+队列只保证消息投递。队列不知道任务的状态、依赖和持有者。agent team 要用的接口是一张共享任务列表。本节在 server 中加这张表。
+
+本节解决第一性排序中的两个关键项：
+- **任务状态和完成信号**：任务有状态。任务有依赖。依赖完成时，server 发事件。
+- **交付恰好生效一次**：消息层只能做到至少一次。本节在任务层加租约和 fencing token。过期的持有者不能提交结果。
+
+### 11.2 术语
+
+| 术语 | 定义 |
+|------|------|
+| 认领（claim） | 一个 agent 取得一个任务的独占执行权。 |
+| 租约（lease） | 认领的有效期。持有者必须在到期前续租。 |
+| fencing token | 每个任务一个整数。每次新认领加 1。从不减小。 |
+| 持有者（holder） | 当前有效认领的 agent。 |
+| 尝试次数（attempts） | 任务被认领的次数。 |
+
+### 11.3 状态机
+
+```
+pending --claim--> claimed --complete--> completed
+                      |------fail------> failed（retry=true 且未用尽时回 pending）
+                      |--租约过期-------> pending（attempts 用尽时 failed）
+pending/claimed --cancel--> cancelled
+```
+
+规则：
+- 只有 `pending` 且全部依赖为 `completed` 的任务可以认领。
+- `completed`、`failed`、`cancelled` 是终态。
+- 依赖为 `failed` 或 `cancelled` 的任务一直不可认领。上层决定怎么处理。
+- server 每 1 秒扫描一次租约。每个任务操作之前也扫描一次。
+
+### 11.4 原语（8 个扩展原语）
+
+这些原语不改动 §2.3 的 11 个核心原语。信封和成帧不变。请求和应答同类型。错误回 `error`。
+
+| 原语 | 请求字段 | 应答字段 |
+|------|---------|---------|
+| `task.create` | `task_id`（可空，server 生成）、`deps`（逗号分隔）、`idem_key`、`max_attempts`（缺省 3）、`payload`（CDATA）；或 `batch`（CDATA，JSON 列表，原子创建） | `task_id`、`created`、`tasks`（CDATA，JSON） |
+| `task.get` | `task_id` | `task`（CDATA，JSON） |
+| `task.list` | `state`（可空） | `tasks`（CDATA，JSON） |
+| `task.claim` | `task_id`（可空，取最早的可认领任务）、`lease_s`（缺省 30）、`workroot`（可空） | `task_id`（空 = 没有可认领任务）、`token`、`lease_expires_at`、`attempts`、`workdir`、`payload`（CDATA） |
+| `task.renew` | `task_id`、`token`、`lease_s` | `task_id`、`token`、`lease_expires_at` |
+| `task.complete` | `task_id`、`token`、`result`（CDATA） | `task_id`、`state`、`unblocked`（逗号分隔） |
+| `task.fail` | `task_id`、`token`、`error`、`retry`（true/false） | `task_id`、`state` |
+| `task.cancel` | `task_id` | `task_id`、`state` |
+
+示例：
+
+```xml
+<msg v="1" type="task.claim" seq="5" ts="..." from="worker-2">
+  <lease_s>30</lease_s><workroot>/work/fx</workroot></msg>
+<msg v="1" type="task.claim" seq="12" in_reply_to="5" ack="5" ts="..." from="server">
+  <task_id>build</task_id><token>2</token><lease_expires_at>1792390000.5</lease_expires_at>
+  <attempts>2</attempts><workdir>/work/fx/build-t2</workdir><payload><![CDATA[...]]></payload></msg>
+```
+
+规则：
+- 创建时，每个依赖必须已存在或在同一批中。环回 AEVT-4103。整批不写入。
+- `idem_key` 已存在时，server 返回原任务，`created=false`。
+- `task.claim` 是原子操作。server 是单线程事件循环，所以同一任务只有一个 agent 认领成功。
+- `task.claim`、`task.renew`、`task.complete`、`task.fail`、`task.cancel` 要求已 register。
+- token 是持有凭证。server 只比 token，不比 agent_id。
+
+### 11.5 fencing
+
+`task.renew`、`task.complete`、`task.fail` 必须携带 token。server 按以下顺序检查：
+1. 扫描过期租约。
+2. token 不等于任务当前 token：回 **AEVT-4101**。
+3. 任务是 `pending`（本次租约已过期）：回 **AEVT-4101**。
+4. 任务是终态：回 **AEVT-4105**。
+
+结果只能经 `task.complete` 写入。所以过期持有者不能写结果。
+
+关键场景：worker A 认领（token=1）。A 卡住超过租约。worker B 认领（token=2）。A 恢复后 complete，server 回 AEVT-4101。B complete，server 接受。
+
+### 11.6 worktree 隔离和 merge gate
+
+token 只能挡住发到 server 的请求。worker 直接改文件不经过 server。所以 token 挡不住文件改动。解决办法：
+
+1. `task.claim` 带 `workroot` 时，应答的 `workdir` = `<workroot>/<task_id>-t<token>`。每次认领一个独立目录。
+2. client 侧 `worktree.prepare(repo, claim)` 建 git worktree，分支为 `task/<task_id>-t<token>`。
+3. `worktree.merge_gate(client, repo, task_id, token)` 先调用 `task.get`。只有 `state=completed` 而且 `completed_token == token` 时，才合并这个分支。否则抛 `MergeRejected`。
+
+server 不运行 git。server 只计算路径。
+
+### 11.7 持久化和恢复
+
+- 文件：`<data_dir>/tasks/log.jsonl`，append-only，每行一条 JSON 记录。
+- 写入顺序：先 append 记录，再改内存，再回应答。
+- 记录类型（字段 `rec`）：`task.create`、`task.claim`（含 `token`、`holder`、`lease_expires_at`、`attempts`、`workdir`）、`task.renew`、`task.complete`（含 `token`、`result`）、`task.fail`（含 `to`）、`task.expire`（含 `to`）、`task.cancel`。
+- 唯一写盘入口：`TaskList._append_log`。刷盘点：`TaskList.flush()`，由 server 的 `_wal_flush` 调用。现在 `flush()` 是空操作。持久化工作（fsync）要覆盖这两处。
+- 恢复：启动时按顺序重放日志。重放和运行用同一个函数（`_apply`）。
+- token 从日志中的 `task.claim` 记录恢复。所以重启后 token 不回退。
+- `lease_expires_at` 是墙钟时间，照原样恢复。停机期间到期的租约，在第一次扫描时过期。
+- 最后一行不完整（崩溃时写了半行）时，重放停在这一行。
+
+### 11.8 事件
+
+server 在 `events` topic 上发以下 subject：`task.created`、`task.claimed`、`task.completed`、`task.unblocked`（`{task_id, by}`）、`task.failed`、`task.expired`、`task.cancelled`（`source=tasklist`）、`task.exhausted`。等待方订阅 `events` 即可。
+
+### 11.9 死信钩子
+
+租约过期或 `fail retry=true` 使 attempts 用尽时，任务转 `failed`，server 调用 `TaskList.on_exhausted(task)`。现在这个钩子只发 `task.exhausted` 事件（`Server._on_task_exhausted`）。死信路径以后接在这里。本节不实现死信。
+
+### 11.10 给上层的接口
+
+两档取消、信任边界、审批快照建在本节的认领接口上：
+- `task.cancel` 现在是立即取消：持有者的 token 随之失效，后续 complete 回 AEVT-4105。
+- “本轮后停”可以在 `task.renew` 的应答中加一个停止标志。
+- 审批快照可以存为一个等待审批的任务，依赖审批任务完成。
+
+### 11.11 Zig server
+
+Zig server 不实现任务层。Zig server 把所有 `task.*` 原语识别为 `task_unsupported`，回 AEVT-4110，不断开连接。
+
+### 11.12 TLA+
+
+`tla/TaskLease.tla` 描述租约和 fencing 的安全性质：任何时刻最多一个有效持有者；completed 的 token 等于最后一次认领的 token；token 单调。这个模型**没有经过 TLC 检查**。
+
+### 11.13 测试
+
+- `tests/test_tasks.py`（单元，假时钟）：依赖和解锁、环、幂等、租约过期和 fencing、续租、attempts 用尽钩子、fail retry、取消、恢复和 token 单调、半行日志、每次认领的 workdir、merge gate 判定。
+- `tests/test_tasks_integration.py`（真实 server 子进程）：解锁事件、环、10 个 worker 并发认领、过期 worker 被拒、续租和 tick 过期、kill -9 重启恢复、worktree merge gate。
