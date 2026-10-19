@@ -180,6 +180,44 @@ class TestTaskList(unittest.TestCase):
             f.write('{"rec": "task.cla')
         self.assertEqual(self.reopen().get("a").state, PENDING)
 
+    def test_torn_line_truncated_before_next_append(self):
+        # 回归：重放不截掉半行时，下一条记录接在半行后面，之后全部丢失。
+        log = os.path.join(self.tmp, "log.jsonl")
+        self.tl.create([{"task_id": "a"}, {"task_id": "b"}])
+        tok = self.tl.claim("A", "a").token
+        with open(log, "a") as f:
+            f.write('{"rec": "task.create", "task_id": "tor')
+        tl2 = self.reopen()
+        self.assertEqual(tl2._log.torn_bytes, len('{"rec": "task.create", "task_id": "tor'))
+        with open(log, "rb") as f:
+            self.assertTrue(f.read().endswith(b"\n"))
+        tl2.create([{"task_id": "c"}])
+        tl2.complete("a", tok)
+        tl3 = self.reopen()
+        self.assertEqual(sorted(t.task_id for t in tl3.list("")), ["a", "b", "c"])
+        self.assertEqual(tl3.get("a").state, COMPLETED)
+        self.assertEqual(tl3.get("c").state, PENDING)
+        self.assertEqual(tl3._log.torn_bytes, 0)
+
+    def test_corrupt_middle_line_raises(self):
+        log = os.path.join(self.tmp, "log.jsonl")
+        self.tl.create([{"task_id": "a"}])
+        with open(log, "a") as f:
+            f.write('garbage\n')
+        self.tl.create([{"task_id": "b"}])
+        with self.assertRaises(ValueError):
+            self.reopen()
+
+    def test_append_fsyncs(self):
+        from unittest import mock
+        with mock.patch("agent_sock.tasks.os.fsync") as fs:
+            self.tl.create([{"task_id": "a"}])
+            self.assertGreaterEqual(fs.call_count, 1)
+            n = fs.call_count
+            self.tl.claim("A", "a")
+            self.assertEqual(fs.call_count, n + 1)
+            self.tl.flush()
+
     def test_workdir_per_claim(self):
         self.tl.create([{"task_id": "t"}])
         a = self.tl.claim("A", "t", lease_s=1, workroot="/w")

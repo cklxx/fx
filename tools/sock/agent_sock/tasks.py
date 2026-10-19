@@ -11,8 +11,8 @@
 fencing：每次新认领，任务的 token 加 1。renew/complete/fail 必须携带当前
 token，否则回 AEVT-4101。token 写入日志，重启后从不回退。
 
-持久化：每次状态变化先 append 一条记录到 tasks/log.jsonl（_append_log），
-再回应答。重启时按顺序重放日志。记录类型见 RECORD_TYPES。
+持久化：每次状态变化先 append 一条记录到 tasks/log.jsonl（_append_log，
+同步 fsync），再回应答。重启时按顺序重放日志。记录类型见 RECORD_TYPES。
 """
 from __future__ import annotations
 
@@ -78,6 +78,9 @@ class TaskList:
         # 钩子：依赖失败级联时调用 hook(task, dep_id)。server 用它发事件。
         self.on_dep_failed = None
         os.makedirs(data_dir, exist_ok=True)
+        # 同步模式：每次 append 后 fsync。#2 合并后改为
+        # durable.AppendLog(self._log_path(), group=server.wal)（同一接口）。
+        self._log = _TaskLog(self._log_path())
         self._load()
 
     # ---- 持久化
@@ -86,28 +89,18 @@ class TaskList:
         return os.path.join(self.data_dir, "log.jsonl")
 
     def _append_log(self, rec: dict) -> None:
-        """单一写盘入口。和 Queue._append_log 同一风格（append-only jsonl）。"""
-        with open(self._log_path(), "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        """单一写盘入口。append 返回时记录已 fsync。"""
+        self._log.append(rec)
 
     def flush(self) -> None:
         """刷盘点。server 的 WAL 批量刷盘（_wal_flush）会调用它。
-        现在为空操作：持久化保证（fsync）由持久化工作统一补上。"""
+        append 已同步 fsync，所以这里没有未刷盘的数据。"""
+        self._log.flush()
 
     def _load(self) -> None:
-        p = self._log_path()
-        if not os.path.exists(p):
-            return
-        with open(p) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    break  # 崩溃写了半行：截断在此（只可能是最后一行）
-                self._apply(rec)
+        # replay() 截掉崩溃时写了一半的最后一行，后续 append 从新行开始。
+        for rec in self._log.replay():
+            self._apply(rec)
         self._recover_cascades()
 
     def _recover_cascades(self) -> None:
@@ -403,3 +396,81 @@ class TaskList:
         """死信钩子（不实现死信本身）。"""
         if self.on_exhausted is not None:
             self.on_exhausted(t)
+
+
+class _TaskLog:
+    """append-only JSONL 日志，同步 fsync。DESIGN.md §11.7。
+
+    接口和 #2 的 durable.AppendLog(path, group=None) 相同（append、replay、
+    flush）。#2 合并后，TaskList 改用 AppendLog，删除本类。
+
+    - append：写一整行，然后 os.fsync，然后返回。
+    - replay：逐条返回记录。末尾没有换行符或无法解析的最后一行是崩溃
+      撕裂，截掉并 fsync。中间行损坏不是撕裂，抛 ValueError。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd: int | None = None
+        self.torn_bytes = 0   # 重放时截掉的尾部字节数
+
+    def _open(self) -> None:
+        if self.fd is not None:
+            return
+        d = os.path.dirname(os.path.abspath(self.path))
+        existed = os.path.exists(self.path)
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                          0o600)
+        if not existed:
+            dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)   # 新文件的目录项落盘
+            finally:
+                os.close(dfd)
+
+    def replay(self):
+        if not os.path.exists(self.path):
+            return
+        with open(self.path, "rb") as f:
+            data = f.read()
+        pos = good_end = 0
+        n = len(data)
+        while pos < n:
+            nl = data.find(b"\n", pos)
+            if nl < 0:
+                break  # 最后一行没有换行符：撕裂
+            line = data[pos:nl].strip()
+            if line:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    if data[nl + 1:].strip():
+                        raise ValueError(
+                            f"{self.path}: corrupt record at byte {pos}")
+                    break  # 最后一行损坏：撕裂
+                yield rec
+            pos = nl + 1
+            good_end = pos
+        if good_end < n:
+            self.torn_bytes = n - good_end
+            os.truncate(self.path, good_end)
+            fd = os.open(self.path, os.O_WRONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def append(self, rec: dict) -> None:
+        self._open()
+        view = memoryview((json.dumps(rec) + "\n").encode("utf-8"))
+        while view:
+            view = view[os.write(self.fd, view):]
+        os.fsync(self.fd)
+
+    def flush(self) -> None:
+        """append 已 fsync。保留此方法，使 TaskList.flush() 的接口不变。"""
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None

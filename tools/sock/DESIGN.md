@@ -594,6 +594,7 @@ v4.1（2026-10-19，任务层）：
 | 75 | 依赖失败级联：依赖 failed/cancelled 时，pending 的传递依赖方转 failed（`dep_failed:<id>`） | §11.3 |
 | 76 | 恢复时补全中途中断的级联（同一个 `_cascade` 函数，幂等，不发事件） | §11.7 |
 | 74 | Zig server 识别 `task.*`，回 AEVT-4110，不断开连接 | §11.7 |
+| 77 | 任务日志持久化：每次 append 后 fsync；重放时截掉撕裂的最后一行，下一条记录从新行开始；中间行损坏时启动失败 | §11.7 |
 
 v4（2026-10-11，REVIEW 25 项全量修复）：
 
@@ -746,11 +747,12 @@ server 不运行 git。server 只计算路径。
 - 文件：`<data_dir>/tasks/log.jsonl`，append-only，每行一条 JSON 记录。
 - 写入顺序：先 append 记录，再改内存，再回应答。
 - 记录类型（字段 `rec`）：`task.create`、`task.claim`（含 `token`、`holder`、`lease_expires_at`、`attempts`、`workdir`）、`task.renew`、`task.complete`（含 `token`、`result`）、`task.fail`（含 `to`；依赖失败级联时另含 `reason=dep_failed`、`dep`，每个变化的任务一条）、`task.expire`（含 `to`）、`task.cancel`。
-- 唯一写盘入口：`TaskList._append_log`。刷盘点：`TaskList.flush()`，由 server 的 `_wal_flush` 调用。现在 `flush()` 是空操作。持久化工作（fsync）要覆盖这两处。
+- 唯一写盘入口：`TaskList._append_log`。它写一整行，然后 `os.fsync`，然后返回。所以应答发出时，记录已落盘。刷盘点：`TaskList.flush()`，由 server 的 `_wal_flush` 调用；因为 append 已同步 fsync，它没有数据要刷。新建日志文件时，fsync 父目录。
+- 日志类：`tasks._TaskLog`，接口和 `durable.AppendLog(path, group=None)` 相同（`append`、`replay`、`flush`）。`durable` 模块（PR #2）合并后，`TaskList` 改用 `AppendLog(path, group=server.wal)`，以组提交代替每条 fsync，并删除 `_TaskLog`。
 - 恢复：启动时按顺序重放日志。重放和运行用同一个函数（`_apply`）。
 - token 从日志中的 `task.claim` 记录恢复。所以重启后 token 不回退。
 - `lease_expires_at` 是墙钟时间，照原样恢复。停机期间到期的租约，在第一次扫描时过期。
-- 最后一行不完整（崩溃时写了半行）时，重放停在这一行。
+- 最后一行不完整（崩溃时写了半行，没有换行符或无法解析）时，重放截掉这一行并 fsync。下一条 append 从新行开始，不接在半行后面。中间行损坏不是崩溃撕裂：`replay` 抛 `ValueError`，server 不启动，不静默丢数据。
 - 级联补全：崩溃可能发生在级联中途，只有一部分依赖方写了 `task.fail`。重放之后、server 接受连接之前，server 对每个 `failed` 或 `cancelled` 任务运行同一个级联函数（`TaskList._cascade`，运行时也用它）。缺失的 `task.fail` 记录（`reason=dep_failed`、`dep`）先写盘，再改内存。这一步是幂等的：已经 `failed` 的依赖方被跳过，不写重复记录。恢复时不发事件；订阅方用 `task.list` 读取当前状态。
 
 ### 11.8 事件
@@ -778,5 +780,5 @@ Zig server 不实现任务层。Zig server 把所有 `task.*` 原语识别为 `t
 
 ### 11.13 测试
 
-- `tests/test_tasks.py`（单元，假时钟）：依赖失败级联（链、菱形、取消和用尽触发、重放）、依赖和解锁、环、幂等、租约过期和 fencing、续租、attempts 用尽钩子、fail retry、取消、恢复和 token 单调、半行日志、每次认领的 workdir、merge gate 判定。
+- `tests/test_tasks.py`（单元，假时钟）：依赖失败级联（链、菱形、取消和用尽触发、重放）、依赖和解锁、环、幂等、租约过期和 fencing、续租、attempts 用尽钩子、fail retry、取消、恢复和 token 单调、半行日志（截掉后再 append 不丢记录）、中间行损坏报错、append 调用 fsync、每次认领的 workdir、merge gate 判定。
 - `tests/test_tasks_integration.py`（真实 server 子进程）：解锁事件、环、10 个 worker 并发认领、过期 worker 被拒、续租和 tick 过期、kill -9 重启恢复、依赖失败级联和重启后重放、worktree merge gate。
