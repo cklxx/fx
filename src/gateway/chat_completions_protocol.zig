@@ -2599,3 +2599,25 @@ test "chat completions prose resembling a call stays prose and cancellation afte
     try test_accept(&cancelled, "[DONE]");
     try std.testing.expectError(error.Cancelled, cancelled.finish(true));
 }
+
+test "chat completions slim tool schemas drop property descriptions only when requested" {
+    const alloc = std.testing.allocator;
+    const functions = [_]model_tool_schema.FunctionSchema{
+        .{ .name = "read_file", .description = "Read a file.", .input_schema = .{
+            .properties = &.{.{ .name = "path", .description = "B2 marker description", .json_type = .string }},
+            .required = &.{"path"},
+            .additional_properties = false,
+        } },
+    };
+    var request = test_request();
+    request.tools = .{ .advertised_names = &.{"read_file"}, .advertised_functions = &functions };
+
+    const full = try build_request(alloc, request, .{});
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "B2 marker description") != null);
+
+    const slim = try build_request(alloc, request, .{ .slim_tool_schemas = true });
+    defer alloc.free(slim);
+    try std.testing.expect(std.mem.indexOf(u8, slim, "B2 marker description") == null);
+    try std.testing.expect(std.mem.indexOf(u8, slim, "\"path\"") != null);
+}

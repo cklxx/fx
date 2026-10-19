@@ -7284,6 +7284,7 @@ fn processQueuedPromptLoop(
                 .provider_options = provider_opts,
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
+                .slim_tool_schemas = config.slim_tool_schemas,
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;

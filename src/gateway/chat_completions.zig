@@ -48,7 +48,7 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity, .slim_tool_schemas = request.slim_tool_schemas });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {

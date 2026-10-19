@@ -2132,7 +2132,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             false,
         .current_prompt_is_root_authority = current_prompt_is_root_authority,
-        .skip_confirm_round = true,
+        // B1: keep the confirmation round. A step with only a silent write
+        // call and no text can be step 1 of a longer plan. Skipping the round
+        // ends the turn early. Re-enable only with a reliable plan signal.
+        .skip_confirm_round = false,
         .slim_tool_schemas = true,
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
