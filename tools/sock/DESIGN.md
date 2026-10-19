@@ -177,7 +177,7 @@ v3 删除 `to` 属性。寻址 = 队列名。点对点 = 发往对方收件箱�
 
 规则：投递前查取消集合（§2.5）。命中则跳过投递，不重投。
 
-**queue.ack** — 确认处理完毕。`<requeue/>` 表示立即重投（原 queue.nack，S3）。
+**queue.ack** — 确认处理完毕。`<requeue/>` 表示重投（原 queue.nack，S3），重投按 §2.6 退避。`<reject/>` 表示消息不可处理：消息直接进死信，不重投。`<requeue/>` 和 `<reject/>` 不能同时出现。server 在 ack 记录落盘后回复 `<result>acked|queued|dead</result>`。
 
 ```xml
 <msg v="1" type="queue.ack" seq="63" ts="..." from="agent-7">
@@ -289,9 +289,11 @@ requeue_or_dead(m):
 
 超时、离开回收、ack+`<requeue/>` 三处都调用它。不准各写一遍。
 
-**参数**：`ack_wait_s` 缺省 30。`max_deliver` 缺省 5。
+**参数**：`ack_wait_s` 缺省 30。`max_deliver` 缺省 5。`backoff_base_s` 缺省 1。`backoff_max_s` 缺省 60。这四个参数在 `queue.consume` 里设置，按 group 生效。
 
-**死信**：不另建存储。原消息不动，append `queue.dead` 事件 + `*.failed`（血缘链）。`asock queue replay-dlq` 重放。
+**重投退避**：消息第 n 次投递失败后（超时、离开回收、ack+`<requeue/>`），server 等待 `d = min(backoff_max_s, backoff_base_s × 2^(n-1))`，再乘以 [0.5, 1) 的随机因子（equal jitter）。等待期间消息不投递，也不占队头。`backoff_base_s=0` 关闭退避。退避截止时间写入日志，重启后继续有效。投递次数达到 `max_deliver` 后进死信。
+
+**死信**：不另建存储。消息状态改为 dead，并记录原因：`rejected`（ack+`<reject/>`）或 `max_deliver`（次数用完）。server 发 `queue.dead` 事件（带 `reason`）。列出死信：Python 用 `asock dlq <queue>`（只读打开日志，server 运行时也可用）；Zig 用 `asock-server --dlq <queue>`。重放：`asock replay-dlq <queue>`（先停 server）。
 
 **背压**：`max_depth` 缺省 10000。超限按 `overflow` 处理：`block`（回 AEVT-4001 + `retry_after_s`）或 `drop_oldest`（挤掉最旧未消费 + 发 `queue.dropped` 事件）。组 pending 超限暂停向该组投递，降至水位线自动恢复。
 
@@ -351,16 +353,28 @@ v2.1 共 27 个原语。v4 共 11 个（新增 `queue.unconsume`）。
 ### 3.1 存储
 
 ```
-queues/<name>/log.jsonl     # append-only 消息日志
-queues/<name>/state.json    # {group: {cursor, pending}}，批量刷盘
-server/cancelled.json       # 取消集合：已取消 task_id，投递前过滤
+queues/<name>/log.jsonl     # append-only 日志：消息和全部状态变化（唯一真相源）
+queues/<name>/decl.json     # 队列声明；重启时 server 按它重建队列
+queues/<name>/state.json    # group 元数据（cursor、参数）；丢失不影响消息状态
 ```
 
-WAL 批量刷盘：每 10ms 或每 100 条消息刷一次 state.json，取先到者。crash 最多丢一个窗口的投递/ack 状态；重放恢复后，未 ack 的 pending 重投。
+日志记录：完整消息记录（publish、压缩）；`op=st` 状态变化（deliver、ack、requeue、dead、replay）；`op=drop`（drop_oldest）；`op=cancel`（tombstone）。旧格式 `cancelled.json` 仍可读。Zig server 用一个文件 `.agent-sock/data/wal.jsonl`，记录 `declare|pub|deliver|ack|requeue|dead|cancel`。
+
+**先落盘再回复**：server 发出任何应答或投递之前，先等它之前的全部日志记录 fsync。所以收到应答的写入在 crash（含断电）后仍在。
+
+**组提交**：同一批次的多次 append 只做一次 fsync。Python：fsync 在线程池运行，事件循环继续处理新请求，新请求进下一批。Zig：append 在引擎锁内，fsync 在锁外，由一个线程为整批执行，其他线程等待并复用结果。
+
+**fail-stop**：write 或 fsync 出错后，server 不再确认任何写入，回 `AEVT-3001`。原因：fsync 报错后内核可能已丢弃脏页，再次 fsync 成功也不能证明数据在盘上。
+
+**目录 fsync**：新建目录、新建日志文件、原子替换（state.json、decl.json、日志压缩）之后，fsync 父目录。
+
+**撕裂尾部**：crash 时最后一行可能只写了一半。重放时 server 截掉这半行，新记录从新行开始。中间行损坏不是撕裂：Python 报错并拒绝启动。
+
+**重启**：crash 时在途（pending）的消息回到 queued 并重投，投递次数保留，所以 `max_deliver` 跨重启有效。group 成员属于连接，重启后清空，消费者重新 consume。
 
 Tombstone 不占队头：FIFO 取队头时先过滤已取消任务再取最小 mid，否则已取消队头饿死其后任务（TLA+ Deliver 的 `m \notin cancelled` 前提）。
 
-Compaction：所有 group 的 cursor 超过 seq N，或距上次 compaction 超 7 天，截断 log 到 N（保留最近 1000 条）。7 天超时强制推进：落后 group 视为已推进，记事件。
+Compaction：所有 group 的 cursor 超过 seq N，或距上次 compaction 超 7 天，截断 log 到 N（保留最近 1000 条）。截断用内存状态重写 log.jsonl（原子替换 + 目录 fsync）。7 天超时强制推进：落后 group 视为已推进，记事件。
 
 `events` 主题落盘：`events/events.jsonl`，先 fsync 再广播。Retention：100MB 一段，保留 10 段；每日 04:00 生成 `events-YYYYMMDD.jsonl.gz`。
 
