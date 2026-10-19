@@ -108,6 +108,15 @@ class TaskList:
                 except json.JSONDecodeError:
                     break  # 崩溃写了半行：截断在此（只可能是最后一行）
                 self._apply(rec)
+        self._recover_cascades()
+
+    def _recover_cascades(self) -> None:
+        """崩溃可能发生在级联中途。重放后，对每个 failed/cancelled 任务重跑
+        同一个 _cascade，补写缺失的 dep_failed 记录。幂等：已 failed 的依赖方
+        被跳过，不写重复记录。此时钩子还没设置，所以恢复不发事件。"""
+        for t in sorted(self.tasks.values(), key=lambda x: x.created_seq):
+            if t.state in (FAILED, CANCELLED):
+                self._cascade(t.task_id)
 
     def _apply(self, rec: dict) -> None:
         """重放一条记录。运行时也走这里，保证运行和恢复是同一份逻辑。"""

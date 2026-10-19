@@ -249,6 +249,33 @@ class TestDepFailed(unittest.TestCase):
         self.assertEqual(self.states(TaskList(self.tmp, now=self.clock)),
                          self.states())
 
+    def _log(self):
+        with open(os.path.join(self.tmp, "log.jsonl")) as f:
+            return f.readlines()
+
+    def test_recovery_completes_interrupted_cascade(self):
+        self.tl.create([{"task_id": "A"}, {"task_id": "B", "deps": ["A"]},
+                        {"task_id": "C", "deps": ["B"]}])
+        a = self.tl.claim("w", "A")
+        self.tl.fail("A", a.token, "boom")
+        lines = self._log()
+        self.assertIn('"dep": "B"', lines[-1])  # C 的记录在最后
+        with open(os.path.join(self.tmp, "log.jsonl"), "w") as f:
+            f.writelines(lines[:-1])  # 模拟崩溃：丢掉 C 的记录
+        tl2 = TaskList(self.tmp, now=self.clock)
+        self.assertEqual((tl2.get("C").state, tl2.get("C").error),
+                         (FAILED, "dep_failed:B"))
+        self.assertEqual(self._log(), lines)  # 记录已补写，内容一致
+
+    def test_recovery_idempotent(self):
+        self.tl.create([{"task_id": "A"}, {"task_id": "B", "deps": ["A"]},
+                        {"task_id": "C", "deps": ["A", "B"]}])
+        self.tl.cancel("A")
+        n = len(self._log())
+        TaskList(self.tmp, now=self.clock)
+        TaskList(self.tmp, now=self.clock)
+        self.assertEqual(len(self._log()), n)
+
     def test_retry_fail_does_not_cascade(self):
         self.tl.create([{"task_id": "A", "max_attempts": 2},
                         {"task_id": "B", "deps": ["A"]}])

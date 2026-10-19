@@ -592,6 +592,7 @@ v4.1（2026-10-19，任务层）：
 | 72 | 新增 §11 任务层：8 个 `task.*` 扩展原语，共享任务列表，租约 + fencing token，每次认领一个 worktree | 第一性排序关键项 1、2 |
 | 73 | 新增错误码 AEVT-4101/4102/4103/4104/4105/4107/4110 | §11.5 |
 | 75 | 依赖失败级联：依赖 failed/cancelled 时，pending 的传递依赖方转 failed（`dep_failed:<id>`） | §11.3 |
+| 76 | 恢复时补全中途中断的级联（同一个 `_cascade` 函数，幂等，不发事件） | §11.7 |
 | 74 | Zig server 识别 `task.*`，回 AEVT-4110，不断开连接 | §11.7 |
 
 v4（2026-10-11，REVIEW 25 项全量修复）：
@@ -750,6 +751,7 @@ server 不运行 git。server 只计算路径。
 - token 从日志中的 `task.claim` 记录恢复。所以重启后 token 不回退。
 - `lease_expires_at` 是墙钟时间，照原样恢复。停机期间到期的租约，在第一次扫描时过期。
 - 最后一行不完整（崩溃时写了半行）时，重放停在这一行。
+- 级联补全：崩溃可能发生在级联中途，只有一部分依赖方写了 `task.fail`。重放之后、server 接受连接之前，server 对每个 `failed` 或 `cancelled` 任务运行同一个级联函数（`TaskList._cascade`，运行时也用它）。缺失的 `task.fail` 记录（`reason=dep_failed`、`dep`）先写盘，再改内存。这一步是幂等的：已经 `failed` 的依赖方被跳过，不写重复记录。恢复时不发事件；订阅方用 `task.list` 读取当前状态。
 
 ### 11.8 事件
 

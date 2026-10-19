@@ -138,6 +138,26 @@ class TaskIntegration(unittest.IsolatedAsyncioTestCase):
                               "b": ("failed", "dep_failed:a"),
                               "c": ("failed", "dep_failed:b")})
 
+    async def test_recovery_finishes_cascade(self):
+        """离线制造中途崩溃的日志，再起 server：C 被补成 failed。"""
+        self.srv.kill9()
+        self.srv.p.stderr.close()
+        from agent_sock.tasks import TaskList
+        tdir = os.path.join(self.srv.data, "tasks")
+        tl = TaskList(tdir)
+        tl.create([{"task_id": "A"}, {"task_id": "B", "deps": ["A"]},
+                   {"task_id": "C", "deps": ["B"]}])
+        tl.fail("A", tl.claim("w", "A").token, "boom")
+        p = os.path.join(tdir, "log.jsonl")
+        with open(p) as f:
+            lines = f.readlines()
+        with open(p, "w") as f:
+            f.writelines(lines[:-1])
+        self.srv.start()
+        c = await self.client("after")
+        t = await c.task_get("C")
+        self.assertEqual((t["state"], t["error"]), ("failed", "dep_failed:B"))
+
     async def test_cycle_rejected(self):
         c = await self.client("orch")
         with self.assertRaises(ClientError) as ctx:
