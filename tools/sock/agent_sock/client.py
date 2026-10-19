@@ -202,7 +202,9 @@ class Client:
     async def consume(self, queue: str, group: str | None = None,
                       ack_wait_s: int = 30, max_deliver: int = 5,
                       filter: str | None = None,
-                      since: int | None = None) -> None:
+                      since: int | None = None,
+                      backoff_base_s: float | None = None,
+                      backoff_max_s: float | None = None) -> None:
         self._subscriptions.append((queue, group, ack_wait_s, max_deliver,
                                     filter, since))
         body = {"queue": queue}
@@ -214,6 +216,10 @@ class Client:
             body["filter"] = filter
         if since is not None:
             body["since"] = str(since)
+        if backoff_base_s is not None:
+            body["backoff_base_s"] = str(backoff_base_s)
+        if backoff_max_s is not None:
+            body["backoff_max_s"] = str(backoff_max_s)
         resp = await self._request(Q_CONSUME, body)
         self._check_error(resp)
 
@@ -226,10 +232,13 @@ class Client:
         self._subscriptions = [s for s in self._subscriptions if s[0] != queue]
 
     async def ack(self, queue: str, group: str, delivery_id: str,
-                  requeue: bool = False) -> str:
+                  requeue: bool = False, reject: bool = False) -> str:
+        """reject=True：消息直接进死信，不重投（ack+<reject/>）。"""
         body = {"queue": queue, "group": group, "delivery_id": delivery_id}
         if requeue:
             body["requeue"] = ""
+        if reject:
+            body["reject"] = ""
         resp = await self._request(Q_ACK, body)
         self._check_error(resp)
         return resp.body.get("result", "acked")

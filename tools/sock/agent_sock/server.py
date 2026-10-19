@@ -11,6 +11,8 @@ import stat
 import time
 
 from . import errors, proto
+from .durable import GroupCommit, makedirs_durable
+from .queue import load_decl
 from .proto import (
     Message, FrameReader, ProtoError,
     REGISTER, HEARTBEAT, DEREGISTER, CARD,
@@ -43,22 +45,33 @@ class Session:
 
 class Server:
     def __init__(self, sock_path: str = DEFAULT_SOCK,
-                 data_dir: str | None = None):
+                 data_dir: str | None = None, fsync: bool = True):
         self.sock_path = sock_path
         self.data_dir = data_dir or os.path.expanduser("~/.agent-sock")
+        # 组提交：所有日志共用。_send 先等它，再写 socket（先落盘再回复）。
+        # fsync=False 只用于测量对照，不用于生产。
+        self.wal = GroupCommit(fsync=fsync)
+        self._retry_timers: dict[str, tuple[float, asyncio.TimerHandle]] = {}
         self.queues: dict[str, Queue] = {}
         self.sessions: dict[str, Session] = {}       # agent_id -> Session
         self.conns: dict[asyncio.StreamWriter, Session | None] = {}
         self._wal_pending = 0
         self._wal_timer: asyncio.TimerHandle | None = None
         self._running = False
-        os.makedirs(os.path.join(self.data_dir, "queues"), exist_ok=True)
+        makedirs_durable(os.path.join(self.data_dir, "queues"))
         self._predeclare()
 
     # ---- 启动
 
     def _predeclare(self):
-        """§2.4 约定队列预声明。"""
+        """§2.4 约定队列预声明。先从数据目录恢复已声明的队列（decl.json）。"""
+        qroot = os.path.join(self.data_dir, "queues")
+        for name in sorted(os.listdir(qroot)):
+            qdir = os.path.join(qroot, name)
+            if name in self.queues or not os.path.isdir(qdir):
+                continue
+            self.queues[name] = Queue(load_decl(qdir, name), qdir,
+                                      wal=self.wal)
         for name, semantics, overflow in [
             ("task.dispatch", "workqueue", "block"),
             ("approval.requests", "workqueue", "block"),
@@ -73,7 +86,8 @@ class Server:
         if q is None:
             q = Queue(QueueDeclare(name=name, semantics=semantics,
                                    max_depth=max_depth, overflow=overflow),
-                      os.path.join(self.data_dir, "queues", name))
+                      os.path.join(self.data_dir, "queues", name),
+                      wal=self.wal)
             self.queues[name] = q
         return q
 
@@ -89,6 +103,8 @@ class Server:
         self._running = True
         loop = asyncio.get_running_loop()
         loop.call_later(1.0, self._tick)
+        for qname in list(self.queues):  # 重启后：退避中的消息定时投递
+            self._arm_retry(qname)
         try:
             # 不用 serve_forever()：Python 3.12+ 里它被取消时先 wait_closed()，
             # 等全部连接结束，而连接还开着，于是一直等
@@ -102,6 +118,14 @@ class Server:
                     w.close()
                 except Exception:
                     pass
+            for _, h in self._retry_timers.values():
+                h.cancel()
+            self._retry_timers.clear()
+            try:
+                self._wal_flush()
+                self.wal.sync_now()
+            except Exception:
+                pass
             await server.wait_closed()
 
     # ---- 连接处理
@@ -142,6 +166,7 @@ class Server:
                 q = self.queues.get(qname)
                 if q:
                     q.unconsume(sess.agent_id, gname)
+                    self._arm_retry(qname)
         try:
             writer.close()
         except Exception:
@@ -175,6 +200,9 @@ class Server:
             await self._send_error(writer, msg, e.code, e.message)
         except errors.ErrorPacket as e:
             await self._send_error(writer, msg, e.code, e.message)
+        except OSError as e:  # WAL 写盘/fsync 失败：不确认，回 AEVT-3001
+            await self._send_error(writer, msg, "AEVT-3001",
+                                   f"wal write failed: {e!r}")
         except Exception as e:  # 防御：单连接异常不杀 server
             await self._send_error(writer, msg, "ASOCK-2006", repr(e))
 
@@ -185,7 +213,12 @@ class Server:
         return sess.seq_out
 
     async def _send(self, writer: asyncio.StreamWriter, msg: Message,
-                    cdata: dict | None = None):
+                    cdata: dict | None = None, durable: bool = True):
+        # 先落盘再回复：本帧之前的所有日志写入 fsync 后才写 socket。
+        # 同一批次的多次写入共用一次 fsync（组提交）。
+        # 错误应答不确认任何状态变化，所以不等 fsync（durable=False）。
+        if durable:
+            await self.wal.commit()
         data = proto.encode_with_cdata(msg, cdata or {})
         writer.write(data)
         await writer.drain()
@@ -198,7 +231,7 @@ class Server:
                       in_reply_to=req.seq if req else None,
                       body={"code": code, "message": message})
         try:
-            await self._send(writer, err)
+            await self._send(writer, err, durable=False)
         except Exception:
             pass
         if code == "ASOCK-2004":  # R-04：超限断开
@@ -246,6 +279,7 @@ class Server:
                 q = self.queues.get(qname)
                 if q:
                     q.unconsume(sess.agent_id, gname)
+                    self._arm_retry(qname)
             self.sessions.pop(sess.agent_id, None)
             await self._emit_event("agent.stopped",
                                    {"agent_id": sess.agent_id,
@@ -384,11 +418,16 @@ class Server:
             ack_wait_s = int(msg.body.get("ack_wait_s", str(DEFAULT_ACK_WAIT_S)))
             max_deliver = int(msg.body.get("max_deliver",
                                            str(DEFAULT_MAX_DELIVER)))
+            bb = msg.body.get("backoff_base_s")
+            bm = msg.body.get("backoff_max_s")
+            backoff_base_s = float(bb) if bb not in (None, "") else None
+            backoff_max_s = float(bm) if bm not in (None, "") else None
         except ValueError:
             await self._send_error(writer, msg, "AEVT-4007", "bad ack params")
             return
         try:
-            g = q.consume(sess.agent_id, group, ack_wait_s, max_deliver)
+            g = q.consume(sess.agent_id, group, ack_wait_s, max_deliver,
+                          backoff_base_s, backoff_max_s)
         except errors.ErrorPacket as e:
             await self._send_error(writer, msg, e.code, e.message)
             return
@@ -409,6 +448,7 @@ class Server:
         q = self.queues.get(name)
         if q is not None:
             q.unconsume(sess.agent_id, group)
+            self._arm_retry(name)
         sess.subscriptions.pop(name, None)
         await self._send(writer, Message(
             type=Q_UNCONSUME, seq=self._next_seq(sess), ack=msg.seq,
@@ -431,8 +471,14 @@ class Server:
             await self._send_error(writer, msg, "AEVT-4007", "bad delivery_id")
             return
         requeue = "requeue" in msg.body  # ack+<requeue/>（S3）
+        reject = "reject" in msg.body    # ack+<reject/>：直接进死信
+        if requeue and reject:
+            await self._send_error(writer, msg, "AEVT-4007",
+                                   "requeue and reject are exclusive")
+            return
         try:
-            result = q.ack(group, mid, sess.agent_id, requeue=requeue)
+            result = q.ack(group, mid, sess.agent_id, requeue=requeue,
+                           reject=reject)
         except errors.ErrorPacket as e:
             await self._send_error(writer, msg, e.code, e.message)
             return
@@ -441,7 +487,10 @@ class Server:
             m = q.messages.get(mid)
             await self._emit_event("queue.dead",
                                    {"queue": name,
-                                    "message_id": m.message_id if m else ""})
+                                    "message_id": m.message_id if m else "",
+                                    "reason": m.reason if m else ""})
+        elif result == "queued":
+            self._arm_retry(name)
         await self._send(writer, Message(
             type=Q_ACK, seq=self._next_seq(sess), ack=msg.seq,
             from_="server", in_reply_to=msg.seq,
@@ -449,6 +498,31 @@ class Server:
         await self._pump(name)
 
     # ---- 投递泵
+
+    def _arm_retry(self, qname: str):
+        """为退避中的消息定时 pump。每个队列只保留最早的一个定时器。"""
+        q = self.queues.get(qname)
+        if q is None or not self._running:
+            return
+        t = q.next_retry_at()
+        if t is None:
+            return
+        cur = self._retry_timers.get(qname)
+        if cur is not None and cur[0] <= t:
+            return
+        if cur is not None:
+            cur[1].cancel()
+        loop = asyncio.get_running_loop()
+        delay = max(0.0, t - time.time())
+
+        def fire(qn=qname):
+            self._retry_timers.pop(qn, None)
+            asyncio.ensure_future(self._pump_and_rearm(qn))
+        self._retry_timers[qname] = (t, loop.call_later(delay, fire))
+
+    async def _pump_and_rearm(self, qname: str):
+        await self._pump(qname)
+        self._arm_retry(qname)
 
     async def _pump(self, qname: str):
         """尝试向各组投递。tombstone 过滤在 queue.deliver 内。"""
@@ -529,10 +603,14 @@ class Server:
                     q = self.queues.get(qname)
                     if q:
                         q.unconsume(agent_id, gname)
+                        self._arm_retry(qname)
             elif idle > SUSPECT_S:
                 sess.status = "suspect"
         for qname, q in self.queues.items():
+            requeued = False
             for mid, result in q.sweep_timeouts(now):
+                if result == "queued":
+                    requeued = True
                 if result == "dead":
                     m = q.messages.get(mid)
                     # 死信事件（fire-and-forget，经事件循环发）
@@ -540,7 +618,10 @@ class Server:
                         lambda qn=qname, mm=m: asyncio.ensure_future(
                             self._emit_event("queue.dead", {
                                 "queue": qn,
-                                "message_id": mm.message_id if mm else ""})))
+                                "message_id": mm.message_id if mm else "",
+                                "reason": mm.reason if mm else ""})))
+            if requeued:
+                self._arm_retry(qname)
             # 主动投递（超时回池后）
             asyncio.get_running_loop().call_soon(
                 lambda qn=qname: asyncio.ensure_future(self._pump(qn)))
@@ -557,23 +638,14 @@ class Server:
         q = self.queues.get(name)
         if not q:
             return []
-        return [{"mid": m.mid, "message_id": m.message_id,
-                 "pend_count": m.pend_count}
-                for m in q.messages.values() if m.state == "dead"]
+        return q.dead_letters()
 
     def replay_dlq(self, name: str) -> int:
-        """死信重放：死信消息重置为 queued。返回重放数。"""
+        """死信重放：死信消息重置为 queued（写日志）。返回重放数。"""
         q = self.queues.get(name)
         if not q:
             return 0
-        n = 0
-        for m in q.messages.values():
-            if m.state == "dead":
-                m.state = "queued"
-                m.pend_count = 0
-                m.pend_consumer = ""
-                n += 1
-        return n
+        return q.replay_dead()
 
     def cancel_task(self, task_id: str) -> bool:
         """R-05：记 tombstone。"""
@@ -589,8 +661,11 @@ def main():
     ap = argparse.ArgumentParser(prog="asock serve")
     ap.add_argument("--sock", default=DEFAULT_SOCK)
     ap.add_argument("--data-dir", default=None)
+    ap.add_argument("--no-fsync", action="store_true",
+                    help="measurement only: skip fsync (unsafe)")
     args = ap.parse_args()
-    srv = Server(sock_path=args.sock, data_dir=args.data_dir)
+    srv = Server(sock_path=args.sock, data_dir=args.data_dir,
+                 fsync=not args.no_fsync)
     asyncio.run(srv.serve())
 
 
