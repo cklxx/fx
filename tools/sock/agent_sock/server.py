@@ -16,8 +16,10 @@ from .proto import (
     REGISTER, HEARTBEAT, DEREGISTER, CARD,
     Q_DECLARE, Q_PUBLISH, Q_CONSUME, Q_UNCONSUME,
     Q_DELIVER, Q_ACK, ERROR,
+    T_CREATE, T_GET, T_LIST, T_CLAIM, T_RENEW, T_COMPLETE, T_FAIL, T_CANCEL,
 )
 from .queue import Queue, QueueDeclare, DEFAULT_ACK_WAIT_S, DEFAULT_MAX_DELIVER
+from .tasks import TaskList, DEFAULT_LEASE_S
 
 DEFAULT_SOCK = os.path.expanduser("~/.agent-sock/agent.sock")
 HEARTBEAT_LEASE_S = 15
@@ -54,6 +56,10 @@ class Server:
         self._running = False
         os.makedirs(os.path.join(self.data_dir, "queues"), exist_ok=True)
         self._predeclare()
+        # §11 共享任务列表。启动时重放 tasks/log.jsonl。
+        self.tasks = TaskList(os.path.join(self.data_dir, "tasks"))
+        self.tasks.on_exhausted = self._on_task_exhausted
+        self._pending_task_events: list[tuple[str, dict]] = []
 
     # ---- 启动
 
@@ -151,6 +157,14 @@ class Server:
             Q_CONSUME: self._h_consume,
             Q_UNCONSUME: self._h_unconsume,
             Q_ACK: self._h_ack,
+            T_CREATE: self._h_task_create,
+            T_GET: self._h_task_get,
+            T_LIST: self._h_task_list,
+            T_CLAIM: self._h_task_claim,
+            T_RENEW: self._h_task_renew,
+            T_COMPLETE: self._h_task_complete,
+            T_FAIL: self._h_task_fail,
+            T_CANCEL: self._h_task_cancel,
         }.get(msg.type)
         if handler is None:
             await self._send_error(writer, msg, "ASOCK-2002",
@@ -501,6 +515,7 @@ class Server:
             for q in self.queues.values():
                 q.snapshot()
             self._wal_pending = 0
+        self.tasks.flush()
 
     # ---- 定时：心跳租约 + ack 超时扫描
 
@@ -518,6 +533,13 @@ class Server:
                         q.unconsume(agent_id, gname)
             elif idle > SUSPECT_S:
                 sess.status = "suspect"
+        # §11 任务租约过期扫描
+        for t in self.tasks.sweep(now):
+            self._queue_task_event("task.expired",
+                                   {"task_id": t.task_id, "state": t.state,
+                                    "token": str(t.token),
+                                    "attempts": str(t.attempts)})
+        self._drain_task_events()
         for qname, q in self.queues.items():
             for mid, result in q.sweep_timeouts(now):
                 if result == "dead":
@@ -533,6 +555,147 @@ class Server:
                 lambda qn=qname: asyncio.ensure_future(self._pump(qn)))
         self._wal_flush()
         asyncio.get_running_loop().call_later(1.0, self._tick)
+
+    # ---- §11 任务层
+
+    def _queue_task_event(self, subject: str, data: dict):
+        self._pending_task_events.append((subject, data))
+
+    def _drain_task_events(self):
+        """同步路径（sweep/钩子）里产生的事件，经事件循环发出。"""
+        evs, self._pending_task_events = self._pending_task_events, []
+        for subject, data in evs:
+            asyncio.ensure_future(self._emit_event(subject, data))
+
+    def _on_task_exhausted(self, t):
+        """死信钩子：attempts 用尽。现在只发 task.exhausted 事件。
+        fix 的死信路径在这里接入（例如把任务写入死信队列）。"""
+        self._queue_task_event("task.exhausted",
+                               {"task_id": t.task_id,
+                                "attempts": str(t.attempts),
+                                "error": t.error})
+
+    async def _task_reply(self, writer, msg: Message, body: dict,
+                          cdata: dict | None = None):
+        sess = self.conns.get(writer)
+        self._wal_bump()
+        await self._send(writer, Message(
+            type=msg.type, seq=self._next_seq(sess), ack=msg.seq,
+            from_="server", in_reply_to=msg.seq, body=body), cdata=cdata)
+        self._drain_task_events()
+
+    def _require_session(self, writer):
+        sess = self.conns.get(writer)
+        if sess is None:
+            raise errors.make("ASOCK-2001", "not registered")
+        return sess
+
+    @staticmethod
+    def _int_field(msg: Message, name: str) -> int:
+        try:
+            return int(msg.body.get(name, ""))
+        except ValueError:
+            raise errors.make("AEVT-4007", f"bad or missing {name}")
+
+    async def _h_task_create(self, writer, msg: Message):
+        batch = msg.body.get("batch", "")
+        if batch:
+            try:
+                specs = json.loads(batch)
+                assert isinstance(specs, list)
+            except Exception:
+                raise errors.make("AEVT-4007", "batch must be a JSON list")
+        else:
+            deps = msg.body.get("deps", "") or ""
+            specs = [{"task_id": msg.body.get("task_id", ""),
+                      "payload": self._extract_payload(msg),
+                      "deps": [d.strip() for d in deps.split(",") if d.strip()],
+                      "idem_key": msg.body.get("idem_key", ""),
+                      "max_attempts": msg.body.get("max_attempts", "")}]
+        res = self.tasks.create(specs)
+        views = []
+        for t, created in res:
+            v = self.tasks.view(t)
+            v["created"] = created
+            views.append(v)
+            if created:
+                await self._emit_event("task.created",
+                                       {"task_id": t.task_id,
+                                        "claimable": str(v["claimable"]).lower()})
+        await self._task_reply(writer, msg, {
+            "task_id": views[0]["task_id"] if len(views) == 1 else "",
+            "created": str(views[0]["created"]).lower() if len(views) == 1 else "",
+            "tasks": ""}, cdata={"tasks": json.dumps(views)})
+
+    async def _h_task_get(self, writer, msg: Message):
+        t = self.tasks.get(msg.body.get("task_id", ""))
+        await self._task_reply(writer, msg, {"task": ""},
+                               cdata={"task": json.dumps(self.tasks.view(t))})
+
+    async def _h_task_list(self, writer, msg: Message):
+        ts = self.tasks.list(msg.body.get("state", "") or "")
+        await self._task_reply(writer, msg, {"tasks": ""}, cdata={
+            "tasks": json.dumps([self.tasks.view(t) for t in ts])})
+
+    async def _h_task_claim(self, writer, msg: Message):
+        sess = self._require_session(writer)
+        t = self.tasks.claim(sess.agent_id,
+                             task_id=msg.body.get("task_id", "") or "",
+                             lease_s=msg.body.get("lease_s", "") or DEFAULT_LEASE_S,
+                             workroot=msg.body.get("workroot", "") or "")
+        if t is None:
+            await self._task_reply(writer, msg, {"task_id": ""})
+            return
+        await self._emit_event("task.claimed", {
+            "task_id": t.task_id, "holder": t.holder, "token": str(t.token)})
+        await self._task_reply(writer, msg, {
+            "task_id": t.task_id, "token": str(t.token),
+            "lease_expires_at": repr(t.lease_expires_at),
+            "attempts": str(t.attempts), "workdir": t.workdir,
+            "payload": ""}, cdata={"payload": t.payload})
+
+    async def _h_task_renew(self, writer, msg: Message):
+        self._require_session(writer)
+        t = self.tasks.renew(msg.body.get("task_id", ""),
+                             self._int_field(msg, "token"),
+                             msg.body.get("lease_s", "") or DEFAULT_LEASE_S)
+        await self._task_reply(writer, msg, {
+            "task_id": t.task_id, "token": str(t.token),
+            "lease_expires_at": repr(t.lease_expires_at)})
+
+    async def _h_task_complete(self, writer, msg: Message):
+        self._require_session(writer)
+        result = msg.body.get("result", "")
+        t, unblocked = self.tasks.complete(
+            msg.body.get("task_id", ""), self._int_field(msg, "token"),
+            result if isinstance(result, str) else "")
+        await self._emit_event("task.completed", {
+            "task_id": t.task_id, "token": str(t.token)})
+        for u in unblocked:
+            await self._emit_event("task.unblocked", {"task_id": u.task_id,
+                                                      "by": t.task_id})
+        await self._task_reply(writer, msg, {
+            "task_id": t.task_id, "state": t.state,
+            "unblocked": ",".join(u.task_id for u in unblocked)})
+
+    async def _h_task_fail(self, writer, msg: Message):
+        self._require_session(writer)
+        t = self.tasks.fail(msg.body.get("task_id", ""),
+                            self._int_field(msg, "token"),
+                            error=msg.body.get("error", "") or "",
+                            retry=msg.body.get("retry", "") == "true")
+        await self._emit_event("task.failed", {
+            "task_id": t.task_id, "state": t.state, "error": t.error})
+        await self._task_reply(writer, msg, {"task_id": t.task_id,
+                                             "state": t.state})
+
+    async def _h_task_cancel(self, writer, msg: Message):
+        self._require_session(writer)
+        t = self.tasks.cancel(msg.body.get("task_id", ""))
+        await self._emit_event("task.cancelled", {"task_id": t.task_id,
+                                                  "source": "tasklist"})
+        await self._task_reply(writer, msg, {"task_id": t.task_id,
+                                             "state": t.state})
 
     # ---- 运维 API（CLI 用）
 

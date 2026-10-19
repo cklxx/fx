@@ -13,7 +13,9 @@ from .proto import (
     Message, FrameReader, ProtoError,
     REGISTER, HEARTBEAT, DEREGISTER, CARD,
     Q_DECLARE, Q_PUBLISH, Q_CONSUME, Q_UNCONSUME, Q_ACK, ERROR,
+    T_CREATE, T_GET, T_LIST, T_CLAIM, T_RENEW, T_COMPLETE, T_FAIL, T_CANCEL,
 )
+import json
 from .server import DEFAULT_SOCK, HEARTBEAT_LEASE_S
 
 
@@ -144,6 +146,20 @@ class Client:
         finally:
             self._pending.pop(seq, None)
 
+    async def _request_cdata(self, mtype: str, body: dict, cdata: dict,
+                             timeout: float = 10.0) -> Message:
+        seq = self._new_seq()
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[seq] = fut
+        for k in cdata:
+            body.setdefault(k, "")
+        await self._send(Message(type=mtype, seq=seq, ack=self.peer_ack,
+                                 from_=self.agent_id, body=body), cdata=cdata)
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._pending.pop(seq, None)
+
     async def _fire(self, mtype: str, body: dict):
         await self._send(Message(type=mtype, seq=self._new_seq(),
                                  ack=self.peer_ack, from_=self.agent_id,
@@ -246,3 +262,78 @@ class Client:
         resp = await self._request(CARD, {"agent_id": agent_id})
         self._check_error(resp)
         return resp.body
+
+    # ---- §11 任务层 API
+
+    async def task_create(self, task_id: str = "", payload: str = "",
+                          deps: list[str] | None = None, idem_key: str = "",
+                          max_attempts: int | None = None) -> dict:
+        """创建一个任务。返回任务视图（含 created 标志）。"""
+        body = {"task_id": task_id, "deps": ",".join(deps or []),
+                "idem_key": idem_key}
+        if max_attempts is not None:
+            body["max_attempts"] = str(max_attempts)
+        resp = self._check_error(await self._request_cdata(
+            T_CREATE, body, {"payload": payload}))
+        return json.loads(resp.body.get("tasks") or "[]")[0]
+
+    async def task_create_batch(self, specs: list[dict]) -> list[dict]:
+        """原子批量创建（批内可互相依赖）。specs 字段同 task_create。"""
+        resp = self._check_error(await self._request_cdata(
+            T_CREATE, {}, {"batch": json.dumps(specs)}))
+        return json.loads(resp.body.get("tasks") or "[]")
+
+    async def task_get(self, task_id: str) -> dict:
+        resp = self._check_error(await self._request(T_GET, {"task_id": task_id}))
+        return json.loads(resp.body.get("task") or "{}")
+
+    async def task_list(self, state: str = "") -> list[dict]:
+        body = {"state": state} if state else {}
+        resp = self._check_error(await self._request(T_LIST, body))
+        return json.loads(resp.body.get("tasks") or "[]")
+
+    async def task_claim(self, task_id: str = "", lease_s: float = 30.0,
+                         workroot: str = "") -> dict | None:
+        """原子认领。返回 {task_id, token, lease_expires_at, attempts,
+        workdir, payload}；没有可认领任务时返回 None。"""
+        body = {"lease_s": repr(float(lease_s))}
+        if task_id:
+            body["task_id"] = task_id
+        if workroot:
+            body["workroot"] = workroot
+        resp = self._check_error(await self._request(T_CLAIM, body))
+        b = resp.body
+        if not b.get("task_id"):
+            return None
+        return {"task_id": b["task_id"], "token": int(b["token"]),
+                "lease_expires_at": float(b["lease_expires_at"]),
+                "attempts": int(b["attempts"]),
+                "workdir": b.get("workdir", "") or "",
+                "payload": b.get("payload", "") or ""}
+
+    async def task_renew(self, task_id: str, token: int,
+                         lease_s: float = 30.0) -> float:
+        resp = self._check_error(await self._request(T_RENEW, {
+            "task_id": task_id, "token": str(token),
+            "lease_s": repr(float(lease_s))}))
+        return float(resp.body["lease_expires_at"])
+
+    async def task_complete(self, task_id: str, token: int,
+                            result: str = "") -> list[str]:
+        """返回本次完成新解锁的任务 id。"""
+        resp = self._check_error(await self._request_cdata(T_COMPLETE, {
+            "task_id": task_id, "token": str(token)}, {"result": result}))
+        u = resp.body.get("unblocked", "") or ""
+        return [x for x in u.split(",") if x]
+
+    async def task_fail(self, task_id: str, token: int, error: str = "",
+                        retry: bool = False) -> str:
+        resp = self._check_error(await self._request(T_FAIL, {
+            "task_id": task_id, "token": str(token), "error": error,
+            "retry": "true" if retry else "false"}))
+        return resp.body.get("state", "")
+
+    async def task_cancel(self, task_id: str) -> str:
+        resp = self._check_error(await self._request(T_CANCEL,
+                                                     {"task_id": task_id}))
+        return resp.body.get("state", "")
