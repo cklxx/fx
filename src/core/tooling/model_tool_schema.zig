@@ -122,7 +122,7 @@ pub fn writeBuiltinFunctionSchema(
     const description = try cappedDescriptionAlloc(alloc, schema.description);
     defer alloc.free(description);
     try writeFunctionSchemaOpen(writer, schema.name, description);
-    try writeObjectSchema(alloc, writer, schema.input_schema, slim);
+    try writeObjectSchema(alloc, writer, schema.input_schema, false);
     try writer.writeByte('}');
 }
 

@@ -183,6 +183,8 @@ pub const RequestData = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
+    /// B2: carries `Config.slim_tool_schemas` to protocols that support it.
+    slim_tool_schemas: bool = false,
 
     pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
         try validate_prompt_lanes(self.instructions, self.messages);
